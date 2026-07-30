@@ -68,9 +68,12 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         usdm.safeTransferFrom(order.user, address(this), collateral_);
         if (fee > 0) collateral[order.maker][order.token] += fee;
 
-        _pushMark(order.maker, order.token, fillPrice_1e18, _markState[order.maker][order.token].currentRatePct, false);
+        {
+            MarkState storage mst = _markState[order.maker][order.token];
+            _pushMark(order.maker, order.token, fillPrice_1e18, mst.currentRateLong, mst.currentRateShort, false);
+        }
 
-        int128 fundingNow = _indexNow(_markState[order.maker][order.token], s.priceTick);
+        int128 fundingNow = _indexNow(_markState[order.maker][order.token], s.priceTick, order.isLong);
 
         id = ++nextPositionId;
         if (order.leverage > type(uint16).max) revert BadLeverage();
@@ -163,8 +166,11 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         usdm.safeTransferFrom(order.user, address(this), addCollateral);
         if (fee > 0) collateral[order.maker][order.token] += fee;
 
-        _pushMark(order.maker, order.token, fillPrice_1e18, _markState[order.maker][order.token].currentRatePct, false);
-        int128 fundingNow = _indexNow(_markState[order.maker][order.token], s.priceTick);
+        {
+            MarkState storage mst = _markState[order.maker][order.token];
+            _pushMark(order.maker, order.token, fillPrice_1e18, mst.currentRateLong, mst.currentRateShort, false);
+        }
+        int128 fundingNow = _indexNow(_markState[order.maker][order.token], s.priceTick, order.isLong);
 
         // Size-weighted blends preserve the old size's unrealized PnL and accrued funding
         // exactly, while the added size enters at fillPrice / current funding.
@@ -219,7 +225,10 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         uint128 closeSizeUnits = _toSizeUnits(order.size, cfg.structural.sizeTick);
         if (closeSizeUnits > p.size) revert BadUserSig();
 
-        _pushMark(order.maker, order.token, fillPrice, _markState[order.maker][order.token].currentRatePct, false);
+        {
+            MarkState storage mst = _markState[order.maker][order.token];
+            _pushMark(order.maker, order.token, fillPrice, mst.currentRateLong, mst.currentRateShort, false);
+        }
 
         (bool liqFound, uint128 markAtLiqUnits, uint16 ringStep) = _ringWalkForLiq(order.maker, order.token, id);
         if (liqFound) {
@@ -252,7 +261,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         ParamCatalog.TokenParams storage cfg = _params[p.token];
         MarkState storage st = _markState[p.maker][p.token];
 
-        int128 fundingNow = _indexNow(st, cfg.structural.priceTick);
+        int128 fundingNow = _indexNow(st, cfg.structural.priceTick, p.isLong);
 
         (int256 pnl, int256 fundingPaid, uint256 payout, uint256 makerCut) =
             _settle(p, closePriceUnits, fundingNow, cfg.structural);
@@ -285,7 +294,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         ParamCatalog.TokenParams storage cfg = _params[p.token];
         MarkState storage st = _markState[p.maker][p.token];
 
-        int128 fundingNow = _indexNow(st, cfg.structural.priceTick);
+        int128 fundingNow = _indexNow(st, cfg.structural.priceTick, p.isLong);
 
         uint256 colPortion = uint256(p.col) * closeSizeUnits / p.size;
 
@@ -375,8 +384,9 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         if (!p.isLong) priceDiff = -priceDiff;
         pnl = priceDiff * int256(uint256(sizeUnits)) * int256(s.notionalScale);
 
+        // `fundingNow`/`fundingCheckpoint` are already this position's OWN side index (two-sided
+        // funding), so a positive delta means this side pays — no cross-side sign flip.
         int256 fundingDelta = int256(fundingNow) - int256(p.fundingCheckpoint);
-        if (!p.isLong) fundingDelta = -fundingDelta;
         // fundingDelta is the funding index change, denominated in the 1e18 price scale (the index
         // integrates fraction/sec × mark). Multiplying by size (asset units) gives price-scaled USDM;
         // ÷ SCALE cancels the 1e18 price scale to land in USDM-wei.
@@ -402,7 +412,8 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         external override nonReentrant whenNotHalted
     {
         if (newMark != 0) {
-            _pushMark(msg.sender, token, newMark, _markState[msg.sender][token].currentRatePct, false);
+            MarkState storage mst = _markState[msg.sender][token];
+            _pushMark(msg.sender, token, newMark, mst.currentRateLong, mst.currentRateShort, false);
         }
         uint256 wipedCount = 0;
         for (uint256 i = 0; i < positionIds.length; i++) {
@@ -428,9 +439,15 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
 
         uint128 markAtK  = st.currentMark;
         uint256 priceTick = cfg.structural.priceTick;
-        int128  indexAtK = _indexNow(st, priceTick);
+        bool    isLong   = p.isLong;
+        int128  indexAtK = _indexNow(st, priceTick, isLong);
         uint64  timeAtK  = uint64(block.timestamp);
-        int64   ratePct  = st.currentRatePct;
+        // We keep NO funding-rate history. Over the walk-back window — at most back to the most
+        // recent sentinel, a few seconds in practice — the rate is ~constant, so we rewind the
+        // funding index at the CURRENT side rate by each segment's ACTUAL elapsed time. The error is
+        // bounded by that tiny window (not the ring's max span) and costs no rate-ring storage; the
+        // real close/liquidation settles funding exactly.
+        int64   rateSide = isLong ? st.currentRateLong : st.currentRateShort;
 
         if (_isLiquidatable(p, markAtK, indexAtK, cfg.structural.sizeTick, cfg.structural.notionalScale))
             return (true, markAtK, 0);
@@ -443,8 +460,8 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
             if (MarkRing.isSentinel(markE)) return (false, 0, 0);
             (int256 priceDelta, uint256 timeDelta10) = MarkRing.unpackEntry(markE);
             uint64 durationSec = uint64(timeDelta10 * MarkRing.GAP_UNIT_MS / 1000);
-            // Step the index back at this segment's fixed-point rate and the mark held during it.
-            indexAtK = FundingIndex.stepBackPct(indexAtK, ratePct, uint256(markAtK) * priceTick, durationSec);
+            // Rewind funding one segment at the current side rate and the mark held during it.
+            indexAtK = FundingIndex.stepBackPct(indexAtK, rateSide, uint256(markAtK) * priceTick, durationSec);
             timeAtK  -= durationSec;
             int256 prev = int256(uint256(markAtK)) - priceDelta;
             if (prev <= 0) return (false, 0, 0);
@@ -453,7 +470,6 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
                 _isLiquidatable(p, markAtK, indexAtK, cfg.structural.sizeTick, cfg.structural.notionalScale)) {
                 return (true, markAtK, uint16(k));
             }
-            ratePct = MarkRing.readRateEntry(_rateRing[maker][token], idx);
         }
         return (false, 0, 0);
     }
@@ -465,8 +481,8 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         uint256 sizeTick,
         uint256 notionalScale
     ) internal view returns (bool) {
+        // `indexAtK`/`fundingCheckpoint` are this position's own side index — no cross-side flip.
         int256 fundingDelta = int256(indexAtK) - int256(p.fundingCheckpoint);
-        if (!p.isLong) fundingDelta = -fundingDelta;
         // ÷ SCALE cancels the 1e18 price scale carried by the funding index; result is USDM-wei.
         int256 fundingPaid = (fundingDelta * int256(uint256(p.size) * sizeTick)) / int256(ParamCatalog.SCALE);
         int256 priceDiff = int256(uint256(markUnits)) - int256(uint256(p.entryPrice));

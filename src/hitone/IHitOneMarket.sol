@@ -86,7 +86,9 @@ interface IHitOneMarket {
         bool    isSentinel,
         uint256 microTimestamp
     );
-    event FundingRateChanged(address indexed maker, address indexed token, int64 oldRate, int64 newRate, uint64 startTime);
+    /// @notice Funding is two-sided: `newRateLong`/`newRateShort` are the new per-side fixed-point
+    /// fraction/sec rates active from `startTime`. Prior values are recoverable from the previous event.
+    event FundingRateChanged(address indexed maker, address indexed token, int64 newRateLong, int64 newRateShort, uint64 startTime);
 
     /// @notice Off-chain indexers can use `(channel, nonce)` to flag a user order as spent.
     event NonceUsed(address indexed user, uint256 indexed channel, uint256 indexed nonce);
@@ -264,11 +266,14 @@ interface IHitOneMarket {
     // view structs
     // ============================================================
 
-    /// @notice Live per-token market state.
+    /// @notice Live per-token market state. Funding is two-sided: each side has its own accumulated
+    /// index and current rate (signed fixed-point fraction/sec, ±1%/sec across int64).
     struct MarketView {
         uint256 mark;               // 1e18 USDM-wei
-        int128  fundingIndex;
-        int64   currentRatePct;     // signed fixed-point funding rate, ±1%/sec across int64
+        int128  fundingIndexLong;
+        int128  fundingIndexShort;
+        int64   currentRateLong;
+        int64   currentRateShort;
         uint64  ringHead;
         uint256 openInterestLong;   // USDM-wei notional
         uint256 openInterestShort;  // USDM-wei notional
@@ -325,7 +330,6 @@ interface IHitOneMarket {
 
     /// @notice Live state of the `(maker, token)` sub-market.
     function marketOf(address maker, address token) external view returns (MarketView memory);
-    function rateRingAt(address maker, address token, uint16 idx) external view returns (int64);
 
     function nextPositionId() external view returns (uint256);
     function activePositionId(address user, address maker, address token) external view returns (uint256);
@@ -402,15 +406,17 @@ interface IHitOneMarket {
 
     function setMark(address token, uint256 newMark) external;
 
-    /// @notice Push a new mark and funding rate for `token`.
-    /// @param newRate Funding rate as a signed fixed-point FRACTION per second:
-    ///   real_fraction_per_sec = newRate / (100 * 2**63). The full int64 range spans ±1%/sec, so the
-    ///   rate is inherently hard-capped at 1%/sec — there is no larger representable value.
-    ///   E.g. 0.01%/hour ≈ (1e-4 / 3600) * 100 * 2**63 ≈ 2.56e13. Positive → longs pay shorts;
-    ///   negative → shorts pay longs. The absolute USDM funding is derived at accrual time as
-    ///   `fraction * mark`, so the effective rate tracks the mark automatically — the maker does
-    ///   NOT rescale it when the price moves (unlike a raw price-denominated rate).
-    function setMarkAndRate(address token, uint256 newMark, int64 newRate) external;
+    /// @notice Push a new mark and TWO-SIDED funding rates for `token`. Longs and shorts each accrue
+    /// an independent funding index at an independent rate; a position pays `(itsSideIndexNow −
+    /// checkpoint) × size` into its maker pool.
+    /// @param rateLong  Long-side funding rate as a signed fixed-point FRACTION per second:
+    ///   real_fraction_per_sec = rateLong / (100 * 2**63). The full int64 range spans ±1%/sec, so the
+    ///   rate is inherently hard-capped at 1%/sec. E.g. 0.01%/hour ≈ 2.56e13. Positive → longs PAY the
+    ///   maker pool; negative → longs RECEIVE from it. Derived as `fraction * mark` at accrual, so it
+    ///   tracks the mark automatically (the maker does NOT rescale it when the price moves).
+    /// @param rateShort Short-side rate, same convention: positive → shorts pay the maker pool.
+    ///   The two sides are independent — this is NOT a zero-sum longs-vs-shorts transfer.
+    function setMarkAndRate(address token, uint256 newMark, int64 rateLong, int64 rateShort) external;
 
     // ============================================================
     // maker: submit user orders

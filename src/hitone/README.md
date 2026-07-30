@@ -152,41 +152,52 @@ Per-maker treasury operations (each callable **only by `makerFunder[maker]`**):
 ## 5. Marks + funding
 
 Each maker pushes marks continuously and funding rates occasionally **to its own
-`(msg.sender, token)` book** — marks, the mark ring, the funding index and the rate are all
+`(msg.sender, token)` book** — marks, the mark ring, the funding indices and the rates are all
 per-maker. One maker's marks never affect another maker's positions (liquidation, funding or
-expiry). Views take a `maker` argument: `marketOf(maker, token)` and `rateRingAt(maker, token, idx)`.
+expiry). Views take a `maker` argument: `marketOf(maker, token)`.
 
-- `setMark(token, newMark)` — push a new mark (1e18 USDM-wei) to your book, rate unchanged.
-- `setMarkAndRate(token, newMark, newRate)` — push mark and a new funding rate to your book.
+- `setMark(token, newMark)` — push a new mark (1e18 USDM-wei) to your book, rates unchanged.
+- `setMarkAndRate(token, newMark, rateLong, rateShort)` — push mark and **both** per-side funding
+  rates to your book.
+
+### Funding is TWO-SIDED
+
+Longs and shorts each accrue an **independent** funding index at an **independent** rate. A
+position pays `(itsSideIndexNow − checkpoint) × size` into its maker pool — this is **not** a
+zero-sum longs-vs-shorts transfer. With both rates positive, both sides pay the pool; either side
+can be negative to pay traders on that side. `marketOf` returns `fundingIndexLong/Short` and
+`currentRateLong/Short` separately.
 
 ### Funding rate encoding (important)
 
-`newRate` is a **signed fixed-point fraction per second**, not a price-scaled amount:
+Each of `rateLong`/`rateShort` is a **signed fixed-point fraction per second**, not a price-scaled
+amount:
 
 ```
-real_fraction_per_sec = newRate / (100 * 2**63)      // PCT_SCALE = 100 << 63
+real_fraction_per_sec = rate / (100 * 2**63)      // PCT_SCALE = 100 << 63
 ```
 
-The full `int64` range spans **±1%/sec**, so the rate is inherently hard-capped — there is no
+The full `int64` range spans **±1%/sec**, so each rate is inherently hard-capped — there is no
 larger representable value and no explicit bound check. The absolute USDM funding is derived at
 accrual time as `fraction × mark`, so **the effective rate tracks the mark automatically — the
-maker does NOT rescale it when price moves.** Positive rate → longs pay shorts; negative →
-shorts pay longs.
+maker does NOT rescale it when price moves.** Positive `rateLong` → longs pay the pool; positive
+`rateShort` → shorts pay the pool; negative → that side receives.
 
 Example: `0.01%/hour ≈ (1e-4 / 3600) * 100 * 2**63 ≈ 2.56e13`.
 
-The funding index integrates `fraction/sec × mark` over time. Positions checkpoint the index at
-open and pay the delta at close/decrease/liquidation. Because the index stays in price-scaled
-units, settlement divides by `SCALE (1e18)` to land in USDM-wei — identical to a
+Each side's funding index integrates `fraction/sec × mark` over time. Positions checkpoint their
+own side's index at open and pay the delta at close/decrease/liquidation. Because the index stays
+in price-scaled units, settlement divides by `SCALE (1e18)` to land in USDM-wei — identical to a
 price-denominated funding model.
 
 ### Mark ring
 
 Every push (after the first) records a packed entry into a 200-slot ring
 (`MarkRing`): a 20-bit signed `priceDelta` in **tick units** and a 12-bit `timeDelta` in
-**milliseconds**. A parallel ring stores the funding rate active during each interval. This
-history powers the liquidation walk-back (§6); off-chain consumers can reconstruct historical
-marks/funding from the `MarkPushed` (priceDelta + timeDeltaMs) and `FundingRateChanged` streams.
+**milliseconds**. Only the *price* history is kept on-chain — there is **no funding-rate ring**
+(see §6 for why the walk-back doesn't need one). This history powers the liquidation walk-back
+(§6); off-chain consumers can reconstruct historical marks/funding from the `MarkPushed`
+(priceDelta + timeDeltaMs) and `FundingRateChanged` streams.
 
 Operator constraints on pushes:
 - **`MarkSameSlot`**: two pushes in the same HP millisecond revert. Rate-limit accordingly.
@@ -222,6 +233,14 @@ Walk-back caveats the liquidation engine must know:
   marks aren't pushed frequently enough, liquidation history is lost. **Push marks regularly.**
 - `increasePosition` resets `openTime`, which moves the walk-back floor forward (the blended
   entry only becomes valid at that point) and restarts the max-duration expiry clock.
+
+**Funding in the walk-back is approximated, on purpose.** The immediate (current-mark)
+liquidation check uses the exact live per-side index. For the *historical* checks the walk rewinds
+each side's funding index at the **current** rate by each segment's actual elapsed time — it keeps
+no per-segment rate history. Over the walk-back window (at most back to the most recent sentinel —
+a few seconds in practice) funding is a sub-basis-point fraction of collateral even at extreme
+leverage and rate, so this is immaterial to the liquidation decision, which is dominated by price.
+The **actual** close/liquidation always settles funding exactly against the live index.
 
 `expirePosition(id)` is permissionless once `openTime + maxPositionDuration` has elapsed; it
 force-closes at the current mark.

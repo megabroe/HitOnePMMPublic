@@ -973,7 +973,7 @@ contract HitOneMarketTest is Test {
     function test_H1_closeConservationWithFunding() public {
         _adv(1);
         vm.prank(maker);
-        h.setMarkAndRate(token, 50_000e18, 1e13);
+        h.setMarkAndRate(token, 50_000e18, 1e13, 0);
 
         _submitOpenLong(alicePk, 1e18, 50_000e18, 50_000e18, 0);
 
@@ -998,7 +998,7 @@ contract HitOneMarketTest is Test {
     function test_fundingRateIsPercentageOfMark() public {
         _adv(1);
         vm.prank(maker);
-        h.setMarkAndRate(token, 50_000e18, 1e13); // ≈ 1.08e-8/sec fraction (~0.0039%/hour)
+        h.setMarkAndRate(token, 50_000e18, 1e13, 0); // ≈ 1.08e-8/sec fraction (~0.0039%/hour)
 
         _submitOpenLong(alicePk, 1e18, 50_000e18, 50_000e18, 0);
 
@@ -1017,6 +1017,46 @@ contract HitOneMarketTest is Test {
         // Sanity: the mark factor makes this ~1.95 USDM; without it (rate x dt) it'd be ~3.9e-5.
         assertGt(expected, 1.9e18);
         assertLt(expected, 2e18);
+    }
+
+    /// @notice Funding is TWO-SIDED and independent: longs pay `rateLong` and shorts pay `rateShort`,
+    /// each into the maker pool. With both rates positive the pool gains from BOTH sides at once — the
+    /// old single-index model would have netted a balanced long/short book's funding to ~zero.
+    function test_fundingTwoSidedIndependentPerSide() public {
+        // alice long, bob short — same maker, same size, flat mark ⇒ zero price PnL on both.
+        _submitOpenLong(alicePk, 1e18, 50_000e18, 50_000e18, 0);
+        _adv(1);
+        IHitOneMarket.Order memory bo = _openOrder(bob, false, 1e18, 100, 50_000e18, 100, 0);
+        vm.prank(maker);
+        h.openPosition(bo, 50_000e18, _sign(bobPk, bo));
+
+        // Distinct per-side rates: shorts pay twice the long rate.
+        _adv(1);
+        vm.prank(maker);
+        h.setMarkAndRate(token, 50_000e18, 1e13, 2e13);
+
+        uint256 poolBefore = h.collateral(maker, token);
+        _adv(uint64(1 hours));
+
+        // Close both flat (no price PnL); each side pays only its OWN funding into the pool.
+        IHitOneMarket.Order memory ac = _closeOrder(alice, true, 1e18, 50_000e18, 100, 1);
+        ac.deadline = type(uint64).max;
+        vm.prank(maker);
+        h.closePosition(ac, 50_000e18, _sign(alicePk, ac));
+        _adv(1);
+        IHitOneMarket.Order memory bc = _closeOrder(bob, false, 1e18, 50_000e18, 100, 1);
+        bc.deadline = type(uint64).max;
+        vm.prank(maker);
+        h.closePosition(bc, 50_000e18, _sign(bobPk, bc));
+
+        uint256 denom     = uint256(100) << 63;
+        uint256 fundLong  = uint256(1e13) * 50_000e18 * uint256(1 hours) / denom;
+        uint256 fundShort = uint256(2e13) * 50_000e18 * uint256(1 hours) / denom;
+        // Pool gained BOTH sides' funding (non-zero-sum), and the short paid ~2x the long.
+        assertApproxEqAbs(h.collateral(maker, token) - poolBefore, fundLong + fundShort, 1e16,
+            "pool must gain long AND short funding independently");
+        assertApproxEqAbs(fundShort, 2 * fundLong, 2, "short rate is independent of the long rate");
+        assertGt(fundLong, 1.9e18);
     }
 
     // ============================================================
@@ -1230,7 +1270,7 @@ contract HitOneMarketTest is Test {
         // maker turns on funding and time passes; maker2's book is unaffected.
         _adv(1);
         vm.prank(maker);
-        h.setMarkAndRate(token, 50_000e18, 1e13);
+        h.setMarkAndRate(token, 50_000e18, 1e13, 0);
         _adv(uint64(1 hours));
 
         // alice grows her position, then maker's mark rises and she exits in two slices.

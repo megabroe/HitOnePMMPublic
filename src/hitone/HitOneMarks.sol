@@ -16,25 +16,33 @@ abstract contract HitOneMarks is HitOneStorage {
     /// @notice Push a mark to the caller's OWN (msg.sender, token) book. Permissionless — anyone
     /// may quote their own market on a registered token.
     function setMark(address token, uint256 newMark) external override whenNotHalted {
-        _pushMark(msg.sender, token, newMark, _markState[msg.sender][token].currentRatePct, false);
+        MarkState storage st = _markState[msg.sender][token];
+        _pushMark(msg.sender, token, newMark, st.currentRateLong, st.currentRateShort, false);
     }
-    // newRate is a signed fixed-point funding FRACTION per second (real = newRate / (100 * 2**63)),
-    // NOT a price-scaled amount. The int64 range inherently caps it at ±1%/sec, so no explicit
-    // bound check is needed. See IHitOneMarket.setMarkAndRate for the full semantics.
-    function setMarkAndRate(address token, uint256 newMark, int64 newRate) external override whenNotHalted {
-        _pushMark(msg.sender, token, newMark, newRate, true);
+    // rateLong/rateShort are signed fixed-point funding FRACTIONS per second (real = rate / (100 *
+    // 2**63)), NOT price-scaled amounts. The int64 range inherently caps each at ±1%/sec, so no
+    // explicit bound check is needed. Each side is independent — see IHitOneMarket.setMarkAndRate.
+    function setMarkAndRate(address token, uint256 newMark, int64 rateLong, int64 rateShort)
+        external override whenNotHalted
+    {
+        _pushMark(msg.sender, token, newMark, rateLong, rateShort, true);
     }
 
-    /// @dev Project the committed funding index forward to now, folding the live funding rate into
-    /// the live mark. `priceTick` converts `currentMark` (price units) back to 1e18 USDM-wei.
-    function _indexNow(MarkState storage st, uint256 priceTick) internal view returns (int128) {
+    /// @dev Project one side's committed funding index forward to now, folding that side's live rate
+    /// into the live mark. `priceTick` converts `currentMark` (price units) back to 1e18 USDM-wei.
+    function _indexNow(MarkState storage st, uint256 priceTick, bool isLong) internal view returns (int128) {
         return FundingIndex.effectiveAtPct(
-            st.fundingIndex, st.currentRatePct, uint256(st.currentMark) * priceTick,
+            isLong ? st.fundingIndexLong : st.fundingIndexShort,
+            isLong ? st.currentRateLong  : st.currentRateShort,
+            uint256(st.currentMark) * priceTick,
             st.lastPushAt, uint64(block.timestamp)
         );
     }
 
-    function _pushMark(address maker, address token, uint256 newMark_1e18, int64 nextRate, bool isRateChange) internal {
+    function _pushMark(
+        address maker, address token, uint256 newMark_1e18,
+        int64 nextRateLong, int64 nextRateShort, bool isRateChange
+    ) internal {
         ParamCatalog.Structural storage s = _params[token].structural;
         if (s.priceTick == 0) revert UnknownToken();
         uint128 newMarkUnits = _toPriceUnits(newMark_1e18, s.priceTick);
@@ -48,9 +56,10 @@ abstract contract HitOneMarks is HitOneStorage {
             st.currentMark = newMarkUnits;
             st.lastPushAt  = uint64(block.timestamp);
             st.lastPushMs  = nowMs;
-            st.currentRatePct = nextRate;
+            st.currentRateLong  = nextRateLong;
+            st.currentRateShort = nextRateShort;
             emit MarkPushed(maker, token, newMark_1e18, 0, 0, false, microTs);
-            if (isRateChange) emit FundingRateChanged(maker, token, 0, nextRate, uint64(block.timestamp));
+            if (isRateChange) emit FundingRateChanged(maker, token, nextRateLong, nextRateShort, uint64(block.timestamp));
             return;
         }
 
@@ -58,10 +67,13 @@ abstract contract HitOneMarks is HitOneStorage {
         uint64 elapsedMs = nowMs - st.lastPushMs;
         if (elapsedMs == 0) revert MarkSameSlot();
 
-        int64 oldRate = st.currentRatePct;
-        // Accrue the elapsed interval at the OLD rate and OLD mark (both still live here — the
-        // mark is a step function held until this push overwrites it below).
-        st.fundingIndex = _indexNow(st, s.priceTick);
+        int64 oldRateLong  = st.currentRateLong;
+        int64 oldRateShort = st.currentRateShort;
+        // Accrue the elapsed interval on BOTH sides at the OLD rate and OLD mark (both still live
+        // here — the mark is a step function held until this push overwrites it below).
+        uint256 mark1e18 = uint256(st.currentMark) * s.priceTick;
+        st.fundingIndexLong  = FundingIndex.effectiveAtPct(st.fundingIndexLong,  oldRateLong,  mark1e18, st.lastPushAt, uint64(block.timestamp));
+        st.fundingIndexShort = FundingIndex.effectiveAtPct(st.fundingIndexShort, oldRateShort, mark1e18, st.lastPushAt, uint64(block.timestamp));
 
         int256 priceDelta;
         unchecked {
@@ -81,7 +93,6 @@ abstract contract HitOneMarks is HitOneStorage {
             emit MarkPushed(maker, token, newMark_1e18, priceDelta, uint16(elapsedUnits), false, microTs);
         }
         MarkRing.writeMarkEntry(_markRing[maker][token], head, markEntry);
-        MarkRing.writeRateEntry(_rateRing[maker][token], head, oldRate);
 
         st.ringHead    = head + 1;
         st.currentMark = newMarkUnits;
@@ -89,8 +100,9 @@ abstract contract HitOneMarks is HitOneStorage {
         st.lastPushMs  = nowMs;
 
         if (isRateChange) {
-            st.currentRatePct = nextRate;
-            emit FundingRateChanged(maker, token, oldRate, nextRate, uint64(block.timestamp));
+            st.currentRateLong  = nextRateLong;
+            st.currentRateShort = nextRateShort;
+            emit FundingRateChanged(maker, token, nextRateLong, nextRateShort, uint64(block.timestamp));
         }
     }
 
@@ -124,16 +136,15 @@ abstract contract HitOneMarks is HitOneStorage {
     function marketOf(address maker, address token) external view override returns (MarketView memory) {
         MarkState storage st = _markState[maker][token];
         return MarketView({
-            mark:             _priceOut(st.currentMark, _params[token].structural.priceTick),
-            fundingIndex:     st.fundingIndex,
-            currentRatePct:      st.currentRatePct,
-            ringHead:         st.ringHead,
+            mark:              _priceOut(st.currentMark, _params[token].structural.priceTick),
+            fundingIndexLong:  st.fundingIndexLong,
+            fundingIndexShort: st.fundingIndexShort,
+            currentRateLong:   st.currentRateLong,
+            currentRateShort:  st.currentRateShort,
+            ringHead:          st.ringHead,
             openInterestLong:  openInterestLong[maker][token],
             openInterestShort: openInterestShort[maker][token]
         });
-    }
-    function rateRingAt(address maker, address token, uint16 idx) external view override returns (int64) {
-        return MarkRing.readRateEntry(_rateRing[maker][token], idx);
     }
 
     // NOTE: `reconstructAt` (historical mark/funding walk-back view) was removed to fit the

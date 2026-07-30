@@ -136,15 +136,23 @@ abstract contract HitOneStorage is
         uint128 currentMark;
         uint64 lastPushAt; // seconds (block.timestamp) — funding clock
         uint64 ringHead;
-        int128 fundingIndex;
-        int64 currentRatePct; // signed fixed-point funding rate, ±1%/sec across int64 (see setMarkAndRate)
+        // Funding is TWO-SIDED: longs and shorts each accrue an independent index at an independent
+        // rate. A position pays `(itsSideIndexNow − checkpoint) × size` into its maker pool (positive
+        // side rate ⇒ that side pays the maker); the sides are NOT a zero-sum transfer to each other.
+        int128 fundingIndexLong;
+        int64 currentRateLong; // signed fixed-point funding rate, ±1%/sec across int64 (see setMarkAndRate)
         uint64 lastPushMs; // milliseconds (HP wall-clock) — ring/liveness clock
+        int128 fundingIndexShort;
+        int64 currentRateShort;
     }
     /// @notice Mark/funding state is per-(maker, token): every maker quotes its OWN market, so
     /// one maker's marks can never trigger liquidations or funding on another's book.
     mapping(address => mapping(address => MarkState)) internal _markState;
     mapping(address => mapping(address => uint256[25])) internal _markRing;
-    mapping(address => mapping(address => uint256[50])) internal _rateRing;
+    // No funding-rate ring: over the mark ring's max span funding is a sub-bps fraction of
+    // collateral even at extreme leverage/rate, so the liquidation walk-back approximates the
+    // historical funding index with a single conservative rewind (see `_ringWalkForLiq`) instead
+    // of stepping a per-segment rate history. Actual close/liquidation settles funding precisely.
 
     struct PendingWithdrawal {
         address maker;
