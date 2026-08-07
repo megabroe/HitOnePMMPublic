@@ -36,10 +36,10 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         uint128 sizeUnits      = _toSizeUnits(order.size, s.sizeTick);
         uint256 markNotional   = _notional(fillPriceUnits, sizeUnits, s.notionalScale);
 
-        // Size-scaled open fee (base + linear + quad in notional), folded into the signed band so
-        // the all-in cost — fee included — stays within the user's worst price.
-        uint256 feeBps = ParamCatalog.sizeFeeBps(markNotional, _usdmDenom, risk.openFeeBps, risk.linearScale, risk.quadScale);
-        _checkSlippageBandWithFee(fillPrice_1e18, order.targetPrice, order.maxSlippageBps, order.isLong, feeBps);
+        // Size-scaled open fee (base + linear + quad in notional, PPM), folded into the signed
+        // band so the all-in cost — fee included — stays within the user's worst price.
+        uint256 feePpm = ParamCatalog.sizeFeePpm(markNotional, _usdmDenom, risk.openFeePpm, risk.linearScale, risk.quadScale);
+        _checkSlippageBandWithFee(fillPrice_1e18, order.targetPrice, order.maxSlippageBps, order.isLong, feePpm);
 
         uint256 collateral_  = markNotional / order.leverage;
         if (collateral_ == 0) revert BadSize();
@@ -58,7 +58,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
             if (skew  > risk.maxOISkew)  revert OISkewCap();
         }
 
-        uint256 fee = (markNotional * feeBps) / ParamCatalog.BPS_DENOM;
+        uint256 fee = (markNotional * feePpm) / ParamCatalog.RATE_DENOM;
         uint256 collAfterFee = collateral_;
         if (fee > 0) {
             if (collAfterFee <= fee) revert Insolvent();
@@ -138,9 +138,9 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         uint256 addCollateral = addNotional / order.leverage;
         if (addCollateral == 0) revert BadSize();
 
-        // Size-scaled open fee on the ADDED notional, folded into the user's signed band.
-        uint256 feeBps = ParamCatalog.sizeFeeBps(addNotional, _usdmDenom, risk.openFeeBps, risk.linearScale, risk.quadScale);
-        _checkSlippageBandWithFee(fillPrice_1e18, order.targetPrice, order.maxSlippageBps, order.isLong, feeBps);
+        // Size-scaled open fee on the ADDED notional (PPM), folded into the user's signed band.
+        uint256 feePpm = ParamCatalog.sizeFeePpm(addNotional, _usdmDenom, risk.openFeePpm, risk.linearScale, risk.quadScale);
+        _checkSlippageBandWithFee(fillPrice_1e18, order.targetPrice, order.maxSlippageBps, order.isLong, feePpm);
 
         uint256 totalNotional = uint256(p.notionalAtOpen) + addNotional;
         if (totalNotional > risk.maxPositionNotional) revert PositionNotionalCap();
@@ -156,7 +156,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         }
 
         // open fee charged only on the added size
-        uint256 fee = (addNotional * feeBps) / ParamCatalog.BPS_DENOM;
+        uint256 fee = (addNotional * feePpm) / ParamCatalog.RATE_DENOM;
         uint256 addColAfterFee = addCollateral;
         if (fee > 0) {
             if (addColAfterFee <= fee) revert Insolvent();
@@ -394,8 +394,9 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
 
         int256 effPnl = pnl - fundingPaid;
         if (effPnl > 0) {
+            // Percent-return winnings cut: ramps on effPnl/col (split-invariant), see ParamCatalog.
             makerCut = ParamCatalog.houseCut(
-                uint256(effPnl), s.cutIntercept, s.cutSlopeBps, s.maxCutBps, _usdmDenom
+                uint256(effPnl), col, s.cutInterceptPpm, s.cutSlopePpm, s.maxCutPpm
             );
             payout = col + uint256(effPnl) - makerCut;
         } else {

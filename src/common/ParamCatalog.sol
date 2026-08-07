@@ -16,8 +16,16 @@ pragma solidity ^0.8.27;
 library ParamCatalog {
     uint256 internal constant SCALE                = 1e18;
     uint256 internal constant BPS_DENOM            = 10_000;
-    uint256 internal constant MAX_FEE_BPS          = 1_000;
-    uint256 internal constant MAX_HOUSE_CUT_BPS    = 5_000;
+    /// @notice Fee / winnings-cut rates are denominated in PPM (parts per million)
+    /// of the base amount: **1 ppm = 0.01 bps**, so "2.5 bps" = 250 ppm. This is
+    /// what makes decimal-bps configs representable — bps-denominated rates can
+    /// only step in whole bps. (`maxSlippageBps` in the signed Order stays bps:
+    /// it's inside the frozen EIP-712 typehash and user tolerances don't need
+    /// sub-bps resolution.)
+    uint256 internal constant RATE_DENOM           = 1_000_000;
+    uint256 internal constant MAX_FEE_BPS          = 1_000;    // Iso Risk.openFeeBps cap (bps venue)
+    uint256 internal constant MAX_FEE_PPM          = 100_000;  // 10% — HitOne openFeePpm cap
+    uint256 internal constant MAX_HOUSE_CUT_PPM    = 500_000;  // 50% ceiling on the cut rate
     uint256 internal constant MIN_LEVERAGE_FLOOR   = 1;
     uint256 internal constant MAX_LEVERAGE_CEIL    = 10_000;
     uint256 internal constant MIN_DURATION_FLOOR   = 1 hours;
@@ -40,11 +48,14 @@ library ParamCatalog {
 
     /// @notice Owner-set, infrequent.
     ///
-    /// **Winnings cut.** The house rake on positive effective PnL is a per-token linear ramp,
-    /// not a flat rate. No cut applies until profit clears `cutIntercept` (USDM-wei). Above it,
-    /// the cut *rate* ramps by `cutSlopeBps` per whole USDM of profit beyond the intercept,
-    /// capped at `maxCutBps`. The cut is then that rate applied to the *whole* effective PnL.
-    /// See `houseCut`.
+    /// **Winnings cut.** The house rake on positive effective PnL is a per-token linear ramp on
+    /// the position's PERCENT RETURN (`effPnl / collateral`), not on nominal profit — a nominal
+    /// threshold/ramp is dodged by splitting one bet across many positions or wallets, while a
+    /// percent-return measure is split-invariant (each slice keeps the same return). No cut
+    /// applies until the return clears `cutInterceptPpm`. Above it, the cut *rate* ramps by
+    /// `cutSlopePpm` per 1e6 ppm (i.e. per +100%) of excess return, capped at `maxCutPpm`. The
+    /// cut is then that rate applied to the *whole* effective PnL. All three are PPM
+    /// (1 ppm = 0.01 bps), so decimal-bps configs are representable. See `houseCut`.
     struct Structural {
         uint256 priceTick;          // min price step in 1e18 USDM-wei (e.g., 1e18 = $1 step)
         uint256 sizeTick;           // min size step in 1e18 asset-wei (e.g., 1e10 = 1 sat for BTC)
@@ -52,9 +63,9 @@ library ParamCatalog {
         uint256 minLeverage;
         uint256 maxLeverage;
         uint256 maxPositionDuration;
-        uint256 cutIntercept;       // USDM-wei of profit below which no winnings cut is taken
-        uint256 cutSlopeBps;        // cut-rate bps added per whole USDM of profit above the intercept
-        uint256 maxCutBps;          // ceiling on the winnings-cut rate
+        uint256 cutInterceptPpm;    // return (effPnl/col, ppm) below which no winnings cut is taken; 100_000 = +10%
+        uint256 cutSlopePpm;        // cut-rate ppm added per 1e6 ppm (+100%) of return above the intercept
+        uint256 maxCutPpm;          // ceiling on the winnings-cut rate, ppm (≤ MAX_HOUSE_CUT_PPM)
     }
 
     /// @notice Maker-set, frequent. Slippage scales are in `sizeUnits`, not 1e18.
@@ -87,43 +98,65 @@ library ParamCatalog {
             p.minLeverage > p.maxLeverage)                                   revert BadLeverage();
         if (p.maxPositionDuration < MIN_DURATION_FLOOR ||
             p.maxPositionDuration > MAX_DURATION_CEIL)                       revert BadDuration();
-        if (p.maxCutBps > MAX_HOUSE_CUT_BPS)                                 revert BadHouseCut();
+        if (p.maxCutPpm > MAX_HOUSE_CUT_PPM)                                 revert BadHouseCut();
     }
 
-    /// @notice Winnings cut on positive effective PnL, as a per-token linear ramp.
-    /// `rate = min(maxBps, slopeBps × (effPnl − intercept) / usdmDenom)` for `effPnl > intercept`
-    /// (else 0), and the returned cut is `effPnl × rate / BPS_DENOM`. `usdmDenom = 10**decimals`
-    /// makes `slopeBps` read as "bps of rate per 1 whole USDM of profit above the intercept".
+    /// @notice Winnings cut on positive effective PnL, ramping on PERCENT RETURN.
+    ///
+    /// `returnPpm = effPnl × 1e6 / col`; below/at `interceptPpm` there is no cut. Above it,
+    /// `rate = min(maxPpm, slopePpm × (returnPpm − interceptPpm) / 1e6)` and the returned cut is
+    /// `effPnl × rate / 1e6`. Split-invariant: k positions with the same leverage and the same
+    /// price move have the same `returnPpm` as the single merged position, so they pay the same
+    /// total cut — opening many small positions (or many wallets) doesn't dodge the rake.
+    ///
+    /// Never reverts (it sits on the close/liquidate path): the ramp saturates at `maxPpm` before
+    /// `slopePpm × excess` could overflow, and a zero-collateral edge (can't happen for a real
+    /// position) is treated as infinite return → capped rate.
     function houseCut(
         uint256 effPnl,
-        uint256 intercept,
-        uint256 slopeBps,
-        uint256 maxBps,
-        uint256 usdmDenom
+        uint256 col,
+        uint256 interceptPpm,
+        uint256 slopePpm,
+        uint256 maxPpm
     ) internal pure returns (uint256) {
-        if (effPnl <= intercept) return 0;
-        uint256 rateBps = slopeBps * (effPnl - intercept) / usdmDenom;
-        if (rateBps > maxBps) rateBps = maxBps;
-        return effPnl * rateBps / BPS_DENOM;
+        if (effPnl == 0 || slopePpm == 0 || maxPpm == 0) return 0;
+        uint256 ratePpm;
+        if (col == 0) {
+            ratePpm = maxPpm; // defensive: infinite return
+        } else {
+            uint256 returnPpm = effPnl * RATE_DENOM / col;
+            if (returnPpm <= interceptPpm) return 0;
+            uint256 excess = returnPpm - interceptPpm;
+            if (excess > type(uint256).max / slopePpm) {
+                ratePpm = maxPpm; // would overflow ⇒ far past the cap anyway
+            } else {
+                ratePpm = slopePpm * excess / RATE_DENOM;
+                if (ratePpm > maxPpm) ratePpm = maxPpm;
+            }
+        }
+        return effPnl * ratePpm / RATE_DENOM;
     }
 
-    /// @notice HitOne size-scaled open-fee rate (bps). `N = notional / usdmDenom` (whole USDM):
-    ///   bps = openFeeBps + linearScale·N / 1e6 + quadScale·N² / 1e12
-    /// `linearScale`/`quadScale` read as "extra bps at $1M notional" (linear ∝ N, quad ∝ N²);
-    /// `0` disables a term. Checked arithmetic reverts on absurd configs (too-large scales).
+    /// @notice HitOne size-scaled open-fee rate (PPM). `N = notional / usdmDenom` (whole USDM):
+    ///   ppm = openFeePpm + linearScale·N / 1e6 + quadScale·N² / 1e12
+    /// `linearScale`/`quadScale` read as "extra ppm at $1M notional" (linear ∝ N, quad ∝ N²) —
+    /// the REF divisors are how fractional slopes are encoded: `linearScale = 100` is
+    /// +100 ppm (= 1 bps) at $1M, i.e. 0.0001 ppm per whole USDM. `0` disables a term.
+    /// Checked arithmetic reverts on absurd configs (too-large scales) — acceptable here
+    /// because this runs at OPEN, never on the close path.
     uint256 internal constant SIZE_FEE_LINEAR_REF = 1e6;   // $1M in whole USDM
     uint256 internal constant SIZE_FEE_QUAD_REF   = 1e12;  // ($1M)²
-    function sizeFeeBps(
+    function sizeFeePpm(
         uint256 notional,
         uint256 usdmDenom,
-        uint256 openFeeBps,
+        uint256 openFeePpm,
         uint256 linearScale,
         uint256 quadScale
-    ) internal pure returns (uint256 bps) {
+    ) internal pure returns (uint256 ppm) {
         uint256 n = notional / usdmDenom;
-        bps = openFeeBps;
-        if (linearScale != 0) bps += linearScale * n / SIZE_FEE_LINEAR_REF;
-        if (quadScale   != 0) bps += quadScale * n * n / SIZE_FEE_QUAD_REF;
+        ppm = openFeePpm;
+        if (linearScale != 0) ppm += linearScale * n / SIZE_FEE_LINEAR_REF;
+        if (quadScale   != 0) ppm += quadScale * n * n / SIZE_FEE_QUAD_REF;
     }
 
     /// @notice Validate `risk`. `linearScale` and `quadScale` are interpreted in sizeUnits.

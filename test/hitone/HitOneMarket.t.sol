@@ -46,12 +46,15 @@ contract HitOneMarketTest is Test {
             priceTick: 1e18, sizeTick: 1e10, notionalScale: 0,
             minLeverage: 100, maxLeverage: 1000,
             maxPositionDuration: 30 days,
-            cutIntercept: 0, cutSlopeBps: 550, maxCutBps: 550
+            // Effectively-flat 5.5% winnings cut: zero intercept and a slope so
+            // steep the cap binds from a +0.0001% return (matches the old
+            // flat-from-$1 default the assertions below assume).
+            cutInterceptPpm: 0, cutSlopePpm: 55_000_000_000, maxCutPpm: 55_000
         });
     }
     function _defaultRisk() internal pure returns (IHitOneMarket.MakerRisk memory) {
         return IHitOneMarket.MakerRisk({
-            openFeeBps: 0, maxPositionNotional: 0, maxOIGross: 0, maxOISkew: 0,
+            openFeePpm: 0, maxPositionNotional: 0, maxOIGross: 0, maxOISkew: 0,
             linearScale: 0, quadScale: 0                 // size fee off
         });
     }
@@ -311,7 +314,7 @@ contract HitOneMarketTest is Test {
     /// extract more fee than the user consented to via slippage.
     function test_openFeeBoundedBySignedSlippage() public {
         IHitOneMarket.MakerRisk memory r = h.makerRiskOf(maker, token);
-        r.openFeeBps = 50;                                   // 0.5% open fee
+        r.openFeePpm = 5_000;                                // 0.5% open fee (50 bps)
         vm.prank(maker);
         h.setRiskLimits(token, r);
 
@@ -329,19 +332,20 @@ contract HitOneMarketTest is Test {
         assertEq(h.positions(id).user, bob);
     }
 
-    /// @notice Size-scaled open fee: `openFeeBps + linearScale·N/1e6 + quadScale·N²/1e12`, N in
-    /// whole USDM, linear/quad = "bps at $1M". At $1M: linear = linearScale, quad = quadScale.
+    /// @notice Size-scaled open fee: `openFeePpm + linearScale·N/1e6 + quadScale·N²/1e12`, N in
+    /// whole USDM, linear/quad = "extra ppm at $1M". At $1M: linear = linearScale, quad = quadScale.
     function test_sizeFeeLinearAndQuad() public {
         IHitOneMarket.MakerRisk memory r = h.makerRiskOf(maker, token);
-        r.linearScale         = 10;             // +10 bps at $1M (∝ N)
-        r.quadScale           = 5;              // +5 bps at $1M (∝ N²)
+        r.linearScale         = 1_000;          // +1000 ppm (10 bps) at $1M (∝ N)
+        r.quadScale           = 500;            // +500 ppm (5 bps) at $1M (∝ N²)
         r.maxPositionNotional = 10_000_000e18;  // allow a $1M position
         vm.prank(maker);
         h.setRiskLimits(token, r);
 
         uint256 poolBefore = h.collateral(maker, token);
 
-        // $1M notional (20 BTC @ $50k, N = 1e6): linear 10 + quad 5 = 15 bps -> fee 1500 USDM.
+        // $1M notional (20 BTC @ $50k, N = 1e6): linear 1000 + quad 500 = 1500 ppm (15 bps)
+        // -> fee 1500 USDM.
         _adv(1);
         IHitOneMarket.Order memory o = _openOrder(bob, true, 20e18, 100, 50_000e18, 100, 0);
         vm.prank(maker);
@@ -1155,9 +1159,9 @@ contract HitOneMarketTest is Test {
     }
 
     function test_increaseChargesFeeOnlyOnAddedSize() public {
-        // openFeeBps = 50 (0.5%)
+        // openFeePpm = 5000 (0.5%)
         IHitOneMarket.MakerRisk memory r = h.makerRiskOf(maker, token);
-        r.openFeeBps = 50;
+        r.openFeePpm = 5_000;
         vm.prank(maker);
         h.setRiskLimits(token, r);
 
@@ -1200,16 +1204,19 @@ contract HitOneMarketTest is Test {
     }
 
     // ============================================================
-    // Winnings-cut ramp (per-token intercept + slope -> max)
+    // Winnings-cut ramp (per-token PERCENT-RETURN intercept + slope -> max)
     // ============================================================
+    // The open below is 1 BTC @ $50k at 100 leverage (lev is 1e2-scaled 100x? no —
+    // leverage 100 = 1.00x? see _openOrder: 100 => notional/100) -> col $500, so
+    // returns are profit/500.
 
-    function _setCutRamp(uint256 intercept, uint256 slopeBps, uint256 maxBps) internal {
+    function _setCutRamp(uint256 interceptPpm, uint256 slopePpm, uint256 maxPpm) internal {
         // Cut params are token-level structural (owner-set). The token is already registered, so
         // this is a TIMELOCKED change: queue it, warp past the delay, execute.
         ParamCatalog.Structural memory s = _structural();
-        s.cutIntercept = intercept;
-        s.cutSlopeBps  = slopeBps;
-        s.maxCutBps    = maxBps;
+        s.cutInterceptPpm = interceptPpm;
+        s.cutSlopePpm     = slopePpm;
+        s.maxCutPpm       = maxPpm;
         config.setToken(token, s);
         uint256 id = config.nextConfigChangeId();
         _t += uint64(h.roleChangeDelay() + 1);
@@ -1218,30 +1225,56 @@ contract HitOneMarketTest is Test {
     }
 
     function test_cutZeroBelowIntercept() public {
-        _setCutRamp(1000e18, 1, 550);
+        // Intercept at +200% return; slope 1% of rate per +100% excess; cap 5.5%.
+        _setCutRamp(2_000_000, 10_000, 55_000);
         _submitOpenLong(alicePk, 1e18, 50_000e18, 50_000e18, 0);
         uint256 before = usdm.balanceOf(alice);
-        _submitCloseLong(alicePk, 1e18, 50_800e18, 50_800e18, 1);  // +$800 < $1000 intercept
-        // no cut: payout = col $500 + profit $800
+        _submitCloseLong(alicePk, 1e18, 50_800e18, 50_800e18, 1);  // +$800 on $500 col = +160%
+        // +160% < +200% intercept -> no cut: payout = col $500 + profit $800
         assertEq(usdm.balanceOf(alice) - before, 1300e18);
     }
 
     function test_cutRampedBetweenInterceptAndMax() public {
-        _setCutRamp(1000e18, 1, 550);
+        // Intercept +100%; slope 1% of rate per +100% excess; cap 5.5%.
+        _setCutRamp(1_000_000, 10_000, 55_000);
         _submitOpenLong(alicePk, 1e18, 50_000e18, 50_000e18, 0);
         uint256 before = usdm.balanceOf(alice);
-        _submitCloseLong(alicePk, 1e18, 51_200e18, 51_200e18, 1);  // +$1200
-        // excess $200 * 1bps/$ = 200bps; cut = 1200 * 2% = 24; payout = 500 + 1200 - 24
-        assertEq(usdm.balanceOf(alice) - before, 1676e18);
+        _submitCloseLong(alicePk, 1e18, 51_200e18, 51_200e18, 1);  // +$1200 on $500 = +240%
+        // excess +140% -> rate = 10_000 × 1.4 = 14_000 ppm (1.4%);
+        // cut = 1200 × 1.4% = 16.8; payout = 500 + 1200 − 16.8
+        assertEq(usdm.balanceOf(alice) - before, 1683.2e18);
     }
 
     function test_cutSaturatesAtMax() public {
-        _setCutRamp(1000e18, 1, 550);
+        _setCutRamp(1_000_000, 10_000, 55_000);
         _submitOpenLong(alicePk, 1e18, 50_000e18, 50_000e18, 0);
         uint256 before = usdm.balanceOf(alice);
-        _submitCloseLong(alicePk, 1e18, 55_000e18, 55_000e18, 1);  // +$5000
-        // excess $4000 -> 4000bps capped at 550; cut = 5000 * 5.5% = 275; payout = 500 + 5000 - 275
+        _submitCloseLong(alicePk, 1e18, 55_000e18, 55_000e18, 1);  // +$5000 on $500 = +1000%
+        // excess +900% -> ramp 90_000 ppm, capped at 55_000 (5.5%);
+        // cut = 5000 × 5.5% = 275; payout = 500 + 5000 − 275
         assertEq(usdm.balanceOf(alice) - before, 5225e18);
+    }
+
+    /// @notice The reason the intercept is a PERCENT: the same bet split across two
+    /// wallets pays exactly the same total cut as one position — nominal-intercept
+    /// dodging is dead.
+    function test_cutSplitAcrossWalletsPaysSameTotal() public {
+        _setCutRamp(1_000_000, 10_000, 55_000);
+
+        // One wallet: 2 BTC (col $1000), +$2400 profit (+240%).
+        _submitOpenLong(alicePk, 2e18, 50_000e18, 50_000e18, 0);
+        uint256 aBefore = usdm.balanceOf(alice);
+        _submitCloseLong(alicePk, 2e18, 51_200e18, 51_200e18, 1);
+        uint256 aPayout = usdm.balanceOf(alice) - aBefore;
+
+        // Two wallets: 1 BTC each (col $500 each), +$1200 each (+240% each).
+        _submitOpenLong(bobPk, 1e18, 50_000e18, 50_000e18, 0);
+        uint256 bBefore = usdm.balanceOf(bob);
+        _submitCloseLong(bobPk, 1e18, 51_200e18, 51_200e18, 1);
+        uint256 bPayout = usdm.balanceOf(bob) - bBefore;
+
+        // Same return %, so the merged position's payout is exactly 2× a slice's.
+        assertEq(aPayout, bPayout * 2, "splitting the bet must not change the total cut");
     }
 
     // ============================================================

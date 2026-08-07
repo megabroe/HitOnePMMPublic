@@ -110,8 +110,8 @@ abstract contract HitOneAdmin is HitOneStorage {
         if (risk.maxPositionNotional == 0) risk.maxPositionNotional = DEFAULT_MAX_POSITION_NOTIONAL;
         if (risk.maxOIGross == 0)          risk.maxOIGross          = type(uint256).max;
         if (risk.maxOISkew == 0)           risk.maxOISkew           = type(uint256).max;
-        // linearScale/quadScale are size-fee multipliers ("bps at $1M notional"); 0 = off, no default.
-        if (risk.openFeeBps > ParamCatalog.MAX_FEE_BPS) revert BadFee();
+        // linearScale/quadScale are size-fee slopes ("extra ppm at $1M notional"); 0 = off, no default.
+        if (risk.openFeePpm > ParamCatalog.MAX_FEE_PPM) revert BadFee();
         _makerRisk[msg.sender][token] = risk;
         emit RiskLimitsSet(msg.sender, token, risk);
     }

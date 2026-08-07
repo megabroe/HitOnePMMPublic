@@ -251,15 +251,15 @@ interface IHitOneMarket {
     /// @notice Per-`(maker, token)` risk limits, set by the maker (permissionless, instant). This is
     /// HitOne's own risk type — the shared `ParamCatalog.Risk` also carries a `maxDevBps` (IsoMarket's
     /// maker-set oracle band), which HitOne does NOT use: its band is owner-set in the oracle config.
-    /// `linearScale`/`quadScale` are the `Slippage` size-impact knobs — reserved (not yet applied by
-    /// HitOne); `type(uint256).max` disables a term. Zero fields resolve to sensible defaults.
+    /// `linearScale`/`quadScale` are the size-fee slopes — "extra ppm at $1M notional" (see
+    /// `ParamCatalog.sizeFeePpm`); `0` disables a term. Zero fields resolve to sensible defaults.
     struct MakerRisk {
-        uint256 openFeeBps;          // open fee, bps of notional (<= 1000); folded into the slippage band
+        uint256 openFeePpm;          // open fee, PPM of notional (1 ppm = 0.01 bps; <= 100_000 = 10%); folded into the slippage band
         uint256 maxPositionNotional; // 0 -> 200_000e18
         uint256 maxOIGross;          // 0 -> unlimited
         uint256 maxOISkew;           // 0 -> unlimited
-        uint256 linearScale;         // 0 -> off (type(uint256).max)
-        uint256 quadScale;           // 0 -> off (type(uint256).max)
+        uint256 linearScale;         // extra fee ppm at $1M notional, ∝ N;  0 -> off
+        uint256 quadScale;           // extra fee ppm at $1M notional, ∝ N²; 0 -> off
     }
 
     // ============================================================
