@@ -1,0 +1,607 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.27;
+
+import { IERC20 }    from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+import { H2Markets }  from "./H2Markets.sol";
+import { H2Orders }   from "./H2Orders.sol";
+import { H2Treasury } from "./H2Treasury.sol";
+import { IH2Oracle }  from "./IH2Oracle.sol";
+import { ParamCatalog } from "../common/ParamCatalog.sol";
+import { MarkRing }     from "../common/MarkRing.sol";
+import { FundingIndex } from "../common/FundingIndex.sol";
+
+/// @title H2Positions
+/// @notice Position lifecycle, priced entirely by the market's oracles.
+///
+/// The PRIMARY entry point is `onMark` — the oracle's pull callback, carrying one action
+/// per call (the oracle isolates calls, so one failing order never unwinds the mark or its
+/// siblings). Orders fill at the just-committed mark ± the feed's capped spread; the fee
+/// curves are charged explicitly and folded, with the spread, into the user's signed band.
+/// Liquidation batches walk the feed's ring against the widened threshold. The fallback
+/// module provides the same operations against the fallback feed once the primary is
+/// stale.
+///
+/// All money settles against the market's lending pool (see H2Treasury): fees, losses and
+/// wipes enter via `_credit`, user wins drain via `_drainPool`. User collateral itself is
+/// wallet-to-wallet.
+abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
+    using SafeERC20 for IERC20;
+
+    // ============================================================
+    // primary path — the oracle's pull callback
+    // ============================================================
+
+    function onMark(uint256 feedId, bytes calldata data) external override nonReentrant {
+        if (msg.sender != address(_oracle)) revert NotOracle();
+        (uint256 marketId, uint8 kind, bytes memory payload) =
+            abi.decode(data, (uint256, uint8, bytes));
+        if (_creatorOf[marketId] == address(0)) revert UnknownMarket();
+        if (_oracles[marketId].primaryFeedId != feedId) revert FeedMismatch();
+
+        // The feed was published in THIS transaction, immediately before this callback —
+        // the freshest price that can exist. Convergence still applies: a fresh fallback
+        // that disagrees blocks the action rather than letting either price win. The mark
+        // is authoritative here, so a stale fallback is simply skipped (requireFallback=false).
+        IH2Oracle.FeedView memory feed = _feed(marketId);
+        _assertConvergence(marketId, feed.mark, false);
+
+        if (kind == uint8(ActionKind.Order_)) {
+            (Order memory order, bytes memory sig) = abi.decode(payload, (Order, bytes));
+            if (order.marketId != marketId) revert FeedMismatch();
+            _verifyAndConsumeOrder(order, sig);
+            // The operator's spread oracle applies, capped by the market's frozen bound.
+            uint256 spreadPpm = feed.spreadPpm;
+            uint256 cap = _risk[marketId].maxSpreadPpm;
+            if (spreadPpm > cap) spreadPpm = cap;
+            _routeOrder(order, _adverseFill(order, feed.mark, spreadPpm, _risk[marketId].priceTick), feed);
+        } else {
+            uint256[] memory ids = abi.decode(payload, (uint256[]));
+            _liquidateBatch(marketId, feed, ids);
+        }
+    }
+
+    /// @dev Fill = base ± spread, direction and tick-rounding both against the taker:
+    /// a long pays up on open and receives down on close (`up = isLong == isOpen`).
+    function _adverseFill(Order memory order, uint256 base1e18, uint256 spreadPpm, uint256 tick)
+        internal pure returns (uint256)
+    {
+        uint256 spread = base1e18 * spreadPpm / PPM;
+        bool up = (order.isLong == order.isOpen);
+        return up ? _ceilToTick(base1e18 + spread, tick) : _floorToTick(base1e18 - spread, tick);
+    }
+
+    function _ceilToTick(uint256 x, uint256 tick) internal pure returns (uint256) {
+        return ((x + tick - 1) / tick) * tick;
+    }
+    /// @dev Clamped to one tick rather than zero: a zero would revert `BadMark` exactly
+    /// when exits matter. Protective versus reverting, not versus the true price; bounded
+    /// by the user's signed band on fills.
+    function _floorToTick(uint256 x, uint256 tick) internal pure returns (uint256) {
+        uint256 f = (x / tick) * tick;
+        return f == 0 ? tick : f;
+    }
+
+    /// @dev Open / increase / close from `isOpen` and the user's active position.
+    function _routeOrder(Order memory order, uint256 fill1e18, IH2Oracle.FeedView memory feed)
+        internal returns (uint256 id)
+    {
+        if (order.isOpen) {
+            id = activePositionId[order.user][order.marketId] == 0
+                ? _openPosition(order, fill1e18, feed)
+                : _increasePosition(order, fill1e18, feed);
+        } else {
+            id = activePositionId[order.user][order.marketId];
+            _closePosition(order, fill1e18, feed);
+        }
+    }
+
+    // ============================================================
+    // open / increase
+    // ============================================================
+
+    function _openPosition(Order memory order, uint256 fill1e18, IH2Oracle.FeedView memory feed)
+        internal returns (uint256 id)
+    {
+        uint256 marketId = order.marketId;
+        RiskParams storage r = _risk[marketId];
+        FeeParams  storage f = _fees[marketId];
+        if (order.size == 0 || order.leverage == 0) revert BadSize();
+        if (activePositionId[order.user][marketId] != 0) revert PositionExists();
+
+        uint128 fillUnits = _toPriceUnits(fill1e18, r.priceTick);
+        uint128 sizeUnits = _toSizeUnits(order.size, r.sizeTick);
+        uint256 notional  = _notional(fillUnits, sizeUnits, r.notionalScale);
+
+        uint256 feePpm = ParamCatalog.sizeFeePpm(notional, _usdmDenom, f.openFlatPpm, f.openLinearScale, f.openQuadScale);
+        _checkBandWithFee(fill1e18, order.targetPrice, order.maxSlippageBps, order.isLong, true, feePpm);
+
+        uint256 collateral_ = notional / order.leverage;
+        if (collateral_ == 0) revert BadSize();
+        if (order.leverage < r.minLeverage || order.leverage > r.maxLeverage) revert BadLeverage();
+        if (notional > r.maxPositionNotional) revert PositionNotionalCap();
+
+        uint256 newLong  = openInterestLong[marketId];
+        uint256 newShort = openInterestShort[marketId];
+        if (order.isLong) newLong  += notional;
+        else              newShort += notional;
+        _checkOICaps(r, newLong, newShort);
+
+        uint256 fee = (notional * feePpm) / PPM;
+        uint256 collAfterFee = collateral_;
+        if (fee > 0) {
+            if (collAfterFee <= fee) revert Insolvent();
+            unchecked { collAfterFee -= fee; }
+        }
+
+        usdm.safeTransferFrom(order.user, address(this), collateral_);
+        if (fee > 0) _credit(marketId, fee);
+
+        int128 fundingNow = _indexNow(feed, order.isLong);
+
+        id = ++nextPositionId;
+        if (order.leverage > type(uint16).max) revert BadLeverage();
+        if (collAfterFee > type(uint128).max) revert BadSize();
+        if (notional > type(uint128).max) revert BadSize();
+        _positions[id] = Position({
+            user:              order.user,
+            openTime:          uint64(block.timestamp),
+            leverage:          uint16(order.leverage),
+            isLong:            order.isLong,
+            closed:            false,
+            marketId:          uint64(marketId),
+            closeTime:         0,
+            openMs:            uint64(_microTimestamp() / 1000),
+            // Fixed forever at first open: increases reset openTime (the walk-back floor)
+            // but never extend expiry.
+            expiresAt:         uint64(block.timestamp) + uint64(r.maxPositionDuration),
+            entryPrice:        fillUnits,
+            size:              sizeUnits,
+            closePrice:        0,
+            col:               uint128(collAfterFee),
+            fundingCheckpoint: fundingNow,
+            realizedPnl:       0,
+            notionalAtOpen:    uint128(notional),
+            makerCutPaid:      0
+        });
+        activePositionId[order.user][marketId] = id;
+        openInterestLong[marketId]  = newLong;
+        openInterestShort[marketId] = newShort;
+
+        emit PositionOpened(
+            id, order.user, marketId, order.isLong, order.size,
+            fill1e18, collAfterFee, uint64(block.timestamp), fundingNow
+        );
+    }
+
+    function _increasePosition(Order memory order, uint256 fill1e18, IH2Oracle.FeedView memory feed)
+        internal returns (uint256 id)
+    {
+        uint256 marketId = order.marketId;
+        RiskParams storage r = _risk[marketId];
+        FeeParams  storage f = _fees[marketId];
+        if (order.size == 0 || order.leverage == 0) revert BadSize();
+
+        id = activePositionId[order.user][marketId];
+        if (id == 0) revert NoPosition();
+        Position storage pos = _positions[id];
+        if (order.isLong   != pos.isLong)   revert BadUserSig();
+        if (order.leverage != pos.leverage) revert BadUserSig();
+        // An increase resets openTime/openMs — the walk-back floor — so it must not be
+        // available to a position with a liquidation already recorded in the ring.
+        {
+            (bool liqFound,,) = _ringWalkForLiq(marketId, id, feed);
+            if (liqFound) revert PositionLiquidatable();
+        }
+
+        uint128 fillUnits    = _toPriceUnits(fill1e18, r.priceTick);
+        uint128 addSizeUnits = _toSizeUnits(order.size, r.sizeTick);
+        uint256 addNotional  = _notional(fillUnits, addSizeUnits, r.notionalScale);
+        uint256 addCollateral = addNotional / order.leverage;
+        if (addCollateral == 0) revert BadSize();
+
+        uint256 feePpm = ParamCatalog.sizeFeePpm(addNotional, _usdmDenom, f.openFlatPpm, f.openLinearScale, f.openQuadScale);
+        _checkBandWithFee(fill1e18, order.targetPrice, order.maxSlippageBps, order.isLong, true, feePpm);
+
+        uint256 totalNotional = uint256(pos.notionalAtOpen) + addNotional;
+        if (totalNotional > r.maxPositionNotional) revert PositionNotionalCap();
+
+        uint256 newLong  = openInterestLong[marketId];
+        uint256 newShort = openInterestShort[marketId];
+        if (order.isLong) newLong += addNotional; else newShort += addNotional;
+        _checkOICaps(r, newLong, newShort);
+
+        uint256 fee = (addNotional * feePpm) / PPM;
+        uint256 addColAfterFee = addCollateral;
+        if (fee > 0) {
+            if (addColAfterFee <= fee) revert Insolvent();
+            unchecked { addColAfterFee -= fee; }
+        }
+
+        usdm.safeTransferFrom(order.user, address(this), addCollateral);
+        if (fee > 0) _credit(marketId, fee);
+
+        int128 fundingNow = _indexNow(feed, order.isLong);
+
+        // Size-weighted blends preserve the old size's unrealized PnL and accrued funding
+        // exactly, while the added size enters at the fill / current funding.
+        uint256 oldSize = uint256(pos.size);
+        uint256 newSize = oldSize + uint256(addSizeUnits);
+        if (newSize >= UNITS_CAP) revert BadSize();
+        uint256 newEntry = (uint256(pos.entryPrice) * oldSize + uint256(fillUnits) * uint256(addSizeUnits)) / newSize;
+        int256  newCheckpoint =
+            (int256(pos.fundingCheckpoint) * int256(oldSize) + int256(fundingNow) * int256(uint256(addSizeUnits)))
+            / int256(newSize);
+
+        uint256 newCol = uint256(pos.col) + addColAfterFee;
+        if (newCol > type(uint128).max)        revert BadSize();
+        if (totalNotional > type(uint128).max) revert BadSize();
+
+        pos.entryPrice        = uint128(newEntry);
+        pos.size              = uint128(newSize);
+        pos.col               = uint128(newCol);
+        pos.fundingCheckpoint = int128(newCheckpoint);
+        pos.notionalAtOpen    = uint128(totalNotional);
+        // The blended entry only becomes valid now; the walk-back floor moves with it.
+        pos.openTime          = uint64(block.timestamp);
+        pos.openMs            = uint64(_microTimestamp() / 1000);
+
+        openInterestLong[marketId]  = newLong;
+        openInterestShort[marketId] = newShort;
+
+        emit PositionIncreased(
+            id, marketId, order.size, fill1e18,
+            _sizeOut(uint128(newSize), r.sizeTick),
+            _priceOut(uint128(newEntry), r.priceTick),
+            addColAfterFee, fee, int128(newCheckpoint)
+        );
+    }
+
+    // ============================================================
+    // close / expire
+    // ============================================================
+
+    function _closePosition(Order memory order, uint256 fill1e18, IH2Oracle.FeedView memory feed) internal {
+        uint256 marketId = order.marketId;
+        RiskParams storage r = _risk[marketId];
+
+        uint256 id = activePositionId[order.user][marketId];
+        if (id == 0) revert NoPosition();
+        Position storage pos = _positions[id];
+        // The signed side must match: the adverse-fill direction derives from it.
+        if (order.isLong != pos.isLong) revert BadUserSig();
+        uint128 closeSizeUnits = _toSizeUnits(order.size, r.sizeTick);
+        if (closeSizeUnits > pos.size) revert BadUserSig();
+
+        // Close-fee fold: the all-in exit price must sit inside the signed band.
+        {
+            FeeParams storage f = _fees[marketId];
+            uint256 closeNotional = _notional(_toPriceUnits(fill1e18, r.priceTick), closeSizeUnits, r.notionalScale);
+            uint256 feePpm = ParamCatalog.sizeFeePpm(closeNotional, _usdmDenom, f.closeFlatPpm, f.closeLinearScale, f.closeQuadScale);
+            _checkBandWithFee(fill1e18, order.targetPrice, order.maxSlippageBps, order.isLong, false, feePpm);
+        }
+
+        (bool liqFound, uint128 markAtLiqUnits, uint16 ringStep) = _ringWalkForLiq(marketId, id, feed);
+        if (liqFound) {
+            _wipePosition(id, markAtLiqUnits, ringStep);
+            return;
+        }
+
+        uint128 fillUnits = _toPriceUnits(fill1e18, r.priceTick);
+        if (closeSizeUnits == pos.size) {
+            _settleClose(id, fillUnits, feed, true);
+        } else {
+            _settleDecrease(id, closeSizeUnits, fillUnits, feed);
+        }
+    }
+
+    function expirePosition(uint256 id) external override nonReentrant {
+        Position storage pos = _positions[id];
+        if (pos.user == address(0)) revert PositionDoesNotExist();
+        if (pos.closed) revert PositionAlreadyClosed();
+        if (block.timestamp < pos.expiresAt) revert PositionDurationNotElapsed();
+        uint256 marketId = pos.marketId;
+        IH2Oracle.FeedView memory feed = _feed(marketId);
+        // Never settle at an uninitialized mark; and under dual oracle failure this stale
+        // mark IS the documented exit.
+        if (feed.lastPushAt == 0) revert PrimaryNeverPushed();
+        uint128 markUnits = uint128(feed.mark / _risk[marketId].priceTick);
+        // Expiry is a forced event: no close fee.
+        uint256 payout_ = _settleClose(id, markUnits, feed, false);
+        emit PositionExpired(id, _priceOut(markUnits, _risk[marketId].priceTick), payout_);
+    }
+
+    function _settleClose(uint256 id, uint128 closeUnits, IH2Oracle.FeedView memory feed, bool chargeCloseFee)
+        internal returns (uint256)
+    {
+        Position storage pos = _positions[id];
+        uint256 marketId = pos.marketId;
+        RiskParams storage r = _risk[marketId];
+
+        int128 fundingNow = _indexNow(feed, pos.isLong);
+        (int256 pnl, int256 fundingPaid, uint256 payout, uint256 cut) =
+            _settleSlice(pos, pos.size, uint256(pos.col), closeUnits, fundingNow, r, _fees[marketId]);
+
+        uint256 closeFee = 0;
+        if (chargeCloseFee) {
+            (payout, closeFee) = _chargeCloseFee(marketId, closeUnits, pos.size, payout);
+        }
+
+        _applyTreasuryDelta(marketId, uint256(pos.col), pnl, fundingPaid, cut);
+        _decreaseOI(marketId, pos.isLong, uint256(pos.notionalAtOpen));
+
+        int256 effPnlNet = pnl - fundingPaid - int256(closeFee);
+        pos.closed       = true;
+        pos.closeTime    = uint64(block.timestamp);
+        pos.closePrice   = closeUnits;
+        pos.realizedPnl  = _toInt128Saturating(effPnlNet);
+        pos.makerCutPaid = uint128(cut);
+        activePositionId[pos.user][marketId] = 0;
+
+        address user = pos.user;
+        emit PositionClosed(id, marketId, _priceOut(closeUnits, r.priceTick), pnl, fundingPaid, cut, closeFee, payout);
+        if (payout > 0) usdm.safeTransfer(user, payout);
+        return payout;
+    }
+
+    function _settleDecrease(uint256 id, uint128 closeSizeUnits, uint128 closeUnits, IH2Oracle.FeedView memory feed)
+        internal
+    {
+        Position storage pos = _positions[id];
+        uint256 marketId = pos.marketId;
+        RiskParams storage r = _risk[marketId];
+
+        int128 fundingNow = _indexNow(feed, pos.isLong);
+        uint256 colPortion = uint256(pos.col) * closeSizeUnits / pos.size;
+
+        (int256 pnl, int256 fundingPaid, uint256 payout, uint256 cut) =
+            _settleSlice(pos, closeSizeUnits, colPortion, closeUnits, fundingNow, r, _fees[marketId]);
+
+        (payout, ) = _chargeCloseFee(marketId, closeUnits, closeSizeUnits, payout);
+        uint256 closeFee;
+        {
+            // recompute for the event (charged amount is min(fee, pre-fee payout))
+            uint256 closeNotional = _notional(closeUnits, closeSizeUnits, r.notionalScale);
+            FeeParams storage f = _fees[marketId];
+            uint256 feePpm = ParamCatalog.sizeFeePpm(closeNotional, _usdmDenom, f.closeFlatPpm, f.closeLinearScale, f.closeQuadScale);
+            closeFee = closeNotional * feePpm / PPM;
+        }
+
+        _applyTreasuryDelta(marketId, colPortion, pnl, fundingPaid, cut);
+
+        uint256 notionalPortion = uint256(pos.notionalAtOpen) * closeSizeUnits / pos.size;
+        _decreaseOI(marketId, pos.isLong, notionalPortion);
+
+        pos.size           = pos.size - closeSizeUnits;
+        pos.col            = uint128(uint256(pos.col) - colPortion);
+        pos.notionalAtOpen = uint128(uint256(pos.notionalAtOpen) - notionalPortion);
+
+        address user = pos.user;
+        emit PositionDecreased(
+            id, marketId, _sizeOut(closeSizeUnits, r.sizeTick),
+            _priceOut(closeUnits, r.priceTick), pnl, fundingPaid, cut, closeFee, payout,
+            _sizeOut(pos.size, r.sizeTick)
+        );
+        if (payout > 0) usdm.safeTransfer(user, payout);
+    }
+
+    /// @dev Charge the close-fee curve on the closed notional, bounded by what is actually
+    /// leaving (a fee can never exceed the payout it is charged against). The charged
+    /// amount is treasury revenue.
+    function _chargeCloseFee(uint256 marketId, uint128 closeUnits, uint128 closeSizeUnits, uint256 payout)
+        internal returns (uint256 newPayout, uint256 charged)
+    {
+        RiskParams storage r = _risk[marketId];
+        FeeParams  storage f = _fees[marketId];
+        uint256 closeNotional = _notional(closeUnits, closeSizeUnits, r.notionalScale);
+        uint256 feePpm = ParamCatalog.sizeFeePpm(closeNotional, _usdmDenom, f.closeFlatPpm, f.closeLinearScale, f.closeQuadScale);
+        uint256 fee = closeNotional * feePpm / PPM;
+        charged = fee < payout ? fee : payout;
+        if (charged > 0) _credit(marketId, charged);
+        newPayout = payout - charged;
+    }
+
+    function _wipePosition(uint256 id, uint128 markAtLiqUnits, uint16 ringStep) internal {
+        Position storage pos = _positions[id];
+        uint256 marketId = pos.marketId;
+        uint256 wiped = uint256(pos.col);
+        _decreaseOI(marketId, pos.isLong, uint256(pos.notionalAtOpen));
+        _credit(marketId, wiped);
+        pos.closed      = true;
+        pos.closeTime   = uint64(block.timestamp);
+        pos.closePrice  = markAtLiqUnits;
+        pos.realizedPnl = _toInt128Saturating(-int256(wiped));
+        activePositionId[pos.user][marketId] = 0;
+        emit PositionLiquidated(id, _priceOut(markAtLiqUnits, _risk[marketId].priceTick), ringStep, wiped);
+    }
+
+    /// @dev Route a settlement's PnL through the lending pool. `effPnl > 0` drains the pool
+    /// and credits the cut back; `effPnl < 0` credits the loss (capped at the slice's
+    /// collateral).
+    function _applyTreasuryDelta(uint256 marketId, uint256 posCol, int256 pnl, int256 fundingPaid, uint256 cut)
+        internal
+    {
+        int256 effPnl = pnl - fundingPaid;
+        if (effPnl > 0) {
+            _drainPool(marketId, uint256(effPnl));
+            if (cut > 0) _credit(marketId, cut);
+        } else if (effPnl < 0) {
+            uint256 loss = uint256(-effPnl);
+            if (loss > posCol) loss = posCol;
+            if (loss > 0) _credit(marketId, loss);
+        }
+    }
+
+    function _decreaseOI(uint256 marketId, bool isLong, uint256 notionalAtOpen) internal {
+        if (isLong) {
+            uint256 oi = openInterestLong[marketId];
+            openInterestLong[marketId] = oi > notionalAtOpen ? oi - notionalAtOpen : 0;
+        } else {
+            uint256 oi = openInterestShort[marketId];
+            openInterestShort[marketId] = oi > notionalAtOpen ? oi - notionalAtOpen : 0;
+        }
+    }
+
+    function _checkOICaps(RiskParams storage r, uint256 newLong, uint256 newShort) internal view {
+        uint256 gross = newLong + newShort;
+        uint256 skew  = newLong > newShort ? newLong - newShort : newShort - newLong;
+        if (gross > r.maxOIGross) revert OIGrossCap();
+        if (skew  > r.maxOISkew)  revert OISkewCap();
+    }
+
+    function _toInt128Saturating(int256 x) internal pure returns (int128) {
+        if (x > type(int128).max) return type(int128).max;
+        if (x < type(int128).min) return type(int128).min;
+        return int128(x);
+    }
+
+    /// @dev Settle PnL + funding for a `sizeUnits` slice carrying `col` collateral.
+    function _settleSlice(
+        Position storage pos,
+        uint128 sizeUnits,
+        uint256 col,
+        uint128 fillUnits,
+        int128 fundingNow,
+        RiskParams storage r,
+        FeeParams storage f
+    ) internal view returns (int256 pnl, int256 fundingPaid, uint256 payout, uint256 cut)
+    {
+        int256 priceDiff = int256(uint256(fillUnits)) - int256(uint256(pos.entryPrice));
+        if (!pos.isLong) priceDiff = -priceDiff;
+        pnl = priceDiff * int256(uint256(sizeUnits)) * int256(uint256(r.notionalScale));
+
+        // Own-side index (two-sided funding): positive delta means this side pays.
+        int256 fundingDelta = int256(fundingNow) - int256(pos.fundingCheckpoint);
+        fundingPaid = (fundingDelta * int256(uint256(sizeUnits) * r.sizeTick)) / int256(ParamCatalog.SCALE);
+
+        int256 effPnl = pnl - fundingPaid;
+        if (effPnl > 0) {
+            cut = ParamCatalog.houseCut(uint256(effPnl), col, f.cutInterceptPpm, f.cutSlopePpm, f.maxCutPpm);
+            payout = col + uint256(effPnl) - cut;
+        } else {
+            uint256 loss = uint256(-effPnl);
+            payout = loss >= col ? 0 : col - loss;
+        }
+    }
+
+    // ============================================================
+    // liquidation
+    // ============================================================
+
+    function _liquidateBatch(uint256 marketId, IH2Oracle.FeedView memory feed, uint256[] memory ids) internal {
+        uint256 wipedCount = 0;
+        for (uint256 i = 0; i < ids.length; i++) {
+            Position storage pos = _positions[ids[i]];
+            if (pos.user == address(0) || pos.closed || pos.marketId != marketId) continue;
+            (bool liqFound, uint128 markAtLiqUnits, uint16 ringStep) = _ringWalkForLiq(marketId, ids[i], feed);
+            if (!liqFound) continue;
+            _wipePosition(ids[i], markAtLiqUnits, ringStep);
+            wipedCount++;
+        }
+        if (wipedCount == 0) revert NoneLiquidated();
+    }
+
+    /// @dev Replay the feed's ring from now back to the position's open, testing the
+    /// WIDENED liquidation threshold at each recorded mark. Skips entirely when the
+    /// feed's last publication predates the position (fallback fills publish nothing) —
+    /// compared on the HP clock, the same clock that governs staleness.
+    function _ringWalkForLiq(uint256 marketId, uint256 id, IH2Oracle.FeedView memory feed)
+        internal view returns (bool found, uint128 markAtLiqUnits, uint16 ringStep)
+    {
+        Position storage pos = _positions[id];
+        if (pos.user == address(0) || pos.closed) return (false, 0, 0);
+        if (feed.lastPushAt == 0) return (false, 0, 0);
+        if (feed.lastPushMs < pos.openMs) return (false, 0, 0);
+        RiskParams storage r = _risk[marketId];
+
+        uint128 markAtK  = uint128(feed.mark / r.priceTick);
+        bool    isLong   = pos.isLong;
+        int128  indexAtK = _indexNow(feed, isLong);
+        // The ring's ms clock — the SAME clock `openMs` was stamped on. The current mark is
+        // post-open (guarded above), so the walk rewinds this exactly to exclude pre-open
+        // marks; at production sub-second cadence a floored-seconds clock would not move and
+        // would test history from before the position existed.
+        uint64  msAtK    = feed.lastPushMs;
+        // No rate history: the walk window is at most a few seconds (bounded by the most
+        // recent sentinel), over which the rate is ~constant; rewind at the current side
+        // rate. The real settlement is always exact.
+        int64   rateSide = isLong ? feed.rateLong : feed.rateShort;
+        uint256 feedId   = _oracles[marketId].primaryFeedId;
+
+        if (_isLiquidatable(pos, markAtK, indexAtK, r)) return (true, markAtK, 0);
+
+        uint256 head = feed.ringHead;
+        uint256 available = head < MarkRing.RING_LEN ? head : MarkRing.RING_LEN;
+        for (uint256 k = 1; k <= available; k++) {
+            uint32 markE = _oracle.ringEntry(feedId, head - k);
+            if (MarkRing.isSentinel(markE)) return (false, 0, 0);
+            (int256 priceDelta, uint256 timeDeltaMs) = MarkRing.unpackEntry(markE);
+            uint64 stepMs = uint64(timeDeltaMs * MarkRing.GAP_UNIT_MS);
+            // msAtK now names the timestamp of the mark we step back TO.
+            msAtK   -= stepMs;
+            indexAtK = FundingIndex.stepBackPct(indexAtK, rateSide, uint256(markAtK) * r.priceTick, stepMs / 1000);
+            int256 prev = int256(uint256(markAtK)) - priceDelta;
+            if (prev <= 0) return (false, 0, 0);
+            markAtK = uint128(uint256(prev));
+            // This mark predates the position; the ring is strictly older from here, so stop.
+            if (msAtK < pos.openMs) return (false, 0, 0);
+            if (_isLiquidatable(pos, markAtK, indexAtK, r)) return (true, markAtK, uint16(k));
+        }
+        return (false, 0, 0);
+    }
+
+    /// @dev The WIDENED threshold: liquidatable once equity (col + effPnl) is within the
+    /// maintenance margin `liqWidthPpm × notional-at-mark` — an early trigger, so the full
+    /// knockout lands before bankruptcy and the treasury keeps gap-risk margin. Width 0
+    /// degenerates to the exact-bankruptcy test.
+    function _isLiquidatable(
+        Position storage pos,
+        uint128 markUnits,
+        int128 indexAtK,
+        RiskParams storage r
+    ) internal view returns (bool) {
+        int256 fundingDelta = int256(indexAtK) - int256(pos.fundingCheckpoint);
+        int256 fundingPaid = (fundingDelta * int256(uint256(pos.size) * r.sizeTick)) / int256(ParamCatalog.SCALE);
+        int256 priceDiff = int256(uint256(markUnits)) - int256(uint256(pos.entryPrice));
+        if (!pos.isLong) priceDiff = -priceDiff;
+        int256 pnl = priceDiff * int256(uint256(pos.size)) * int256(uint256(r.notionalScale));
+        int256 equity = int256(uint256(pos.col)) + pnl - fundingPaid;
+        uint256 maint = _notional(markUnits, pos.size, r.notionalScale) * uint256(r.liqWidthPpm) / PPM;
+        return equity <= int256(maint);
+    }
+
+    // ============================================================
+    // views
+    // ============================================================
+
+    function positions(uint256 id) external view override returns (PositionView memory v) {
+        Position storage pos = _positions[id];
+        RiskParams storage r = _risk[pos.marketId];
+        int256 effPnl_ = int256(pos.realizedPnl);
+        uint256 payout_;
+        if (pos.closed) {
+            int256 net = int256(uint256(pos.col)) + effPnl_ - int256(uint256(pos.makerCutPaid));
+            payout_ = net > 0 ? uint256(net) : 0;
+        }
+        v = PositionView({
+            user:              pos.user,
+            marketId:          pos.marketId,
+            isLong:            pos.isLong,
+            size:              _sizeOut(pos.size, r.sizeTick),
+            leverage:          uint256(pos.leverage),
+            entryPrice:        _priceOut(pos.entryPrice, r.priceTick),
+            col:               uint256(pos.col),
+            fundingCheckpoint: pos.fundingCheckpoint,
+            openTime:          pos.openTime,
+            expiresAt:         pos.expiresAt,
+            notionalAtOpen:    uint256(pos.notionalAtOpen),
+            closed:            pos.closed,
+            closeTime:         pos.closeTime,
+            closePrice:        _priceOut(pos.closePrice, r.priceTick),
+            realizedPnl:       effPnl_,
+            makerCutPaid:      uint256(pos.makerCutPaid),
+            payoutReceived:    payout_
+        });
+    }
+}

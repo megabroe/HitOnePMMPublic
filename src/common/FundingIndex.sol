@@ -8,10 +8,9 @@ import { MarkRing } from "./MarkRing.sol";
 /// funding rate over time in price-scaled units; positions checkpoint it at open and pay the
 /// delta at close. Two rate conventions are supported:
 ///   - absolute  ({effectiveAt}/{stepBack}): rate is an absolute price-scaled per-second value.
-///     Used by IsoMarket.
 ///   - percentage ({effectiveAtPct}/{stepBackPct}): rate is a signed fixed-point FRACTION per
-///     second and the absolute per-second amount is derived as `ratePct/PCT_SCALE * mark1e18`.
-///     Used by HitOneMarket so the effective funding tracks the mark without the maker rescaling it.
+///     second and the absolute per-second amount is derived as `ratePct/PCT_SCALE * mark1e18`,
+///     so the effective funding tracks the mark without any party rescaling it.
 /// Both conventions leave the index in the same price-scaled units, so settlement is identical.
 library FundingIndex {
     /// @dev Denominator for percentage rates: real_fraction_per_sec = ratePct / PCT_SCALE. The

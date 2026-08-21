@@ -2,18 +2,19 @@
 pragma solidity ^0.8.27;
 
 /// @title MarkRing
-/// @notice Packed ring-buffer encodings for IsoMarket — both the mark-price history (32-bit
-/// packed entries, 8/slot) and the parallel funding-rate ring (int64 entries, 4/slot).
+/// @notice Packed ring-buffer encodings for an on-chain price feed — both the mark-price
+/// history (32-bit packed entries, 8/slot) and the parallel funding-rate ring (int64 entries,
+/// 4/slot).
 ///
 /// Mark ring: each slot is 32 bits — int20 priceDelta (tick units, high 20) + uint12 timeDelta
-/// (1ms units, low 12). `timeDelta == 0` is the SENTINEL — written by `setMark` after a
-/// >4.095s gap to signal a ring discontinuity. Walk-back consumers must stop at a sentinel.
-/// A same-1ms-window push is forbidden by the contract (caller must coalesce).
+/// (1ms units, low 12). `timeDelta == 0` is the SENTINEL — written after a >4.095 s gap to
+/// signal a ring discontinuity. Walk-back consumers must stop at a sentinel. A same-1ms-window
+/// push is forbidden by the feed (the caller must coalesce).
 ///
-/// Rate ring: parallel, same RING_LEN, packed as 4 × int64 per uint256 slot. Each slot
-/// records the funding rate active during the interval *ending* at the matching mark entry's
-/// timestamp. `setMark` writes the unchanged `currentRate`. `setMarkAndRate` writes the
-/// **old** rate (which was active during the ending interval), then updates `currentRate`.
+/// Rate ring: parallel, same RING_LEN, packed as 4 × int64 per uint256 slot. Each slot records
+/// the funding rate active during the interval *ending* at the matching mark entry's timestamp.
+/// A mark-only push writes the unchanged current rate; a mark-and-rate push writes the OLD rate
+/// (which was active during the ending interval), then updates the current rate.
 library MarkRing {
     error MarkDeltaTooLarge();
 
@@ -39,7 +40,7 @@ library MarkRing {
         return (priceBits << 12) | timeBits;
     }
 
-    /// @notice Sentinel entry: timeDelta = 0, priceDelta = 0. Marks a gap > 2.55s in the ring.
+    /// @notice Sentinel entry: timeDelta = 0, priceDelta = 0. Marks a gap > 4.095 s in the ring.
     /// Walk-backs stop here.
     function sentinelEntry() internal pure returns (uint32) {
         return 0;

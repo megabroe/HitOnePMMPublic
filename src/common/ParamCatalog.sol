@@ -3,10 +3,9 @@ pragma solidity ^0.8.27;
 
 /// @title ParamCatalog
 /// @notice Per-token configuration shared by every venue. Two cadences:
-///   - `Structural` — owner-set, infrequent. Tick granularity (price + size), leverage range,
+///   - `Structural` — infrequent. Tick granularity (price + size), leverage range,
 ///     position lifetime, house cut.
-///   - `Risk` — maker-set, frequent. Fee, slippage scales (in sizeUnits), OI caps,
-///     oracle deviation band.
+///   - `Risk` — frequent. Fee, slippage scales (in sizeUnits), OI caps, oracle deviation band.
 ///
 /// **Internal-vs-external scale.** External API takes price/size in 1e18-scaled USDM-wei and
 /// asset-wei (unchanged from prior versions). Internally, every venue stores priceUnits and
@@ -23,8 +22,8 @@ library ParamCatalog {
     /// it's inside the frozen EIP-712 typehash and user tolerances don't need
     /// sub-bps resolution.)
     uint256 internal constant RATE_DENOM           = 1_000_000;
-    uint256 internal constant MAX_FEE_BPS          = 1_000;    // Iso Risk.openFeeBps cap (bps venue)
-    uint256 internal constant MAX_FEE_PPM          = 100_000;  // 10% — HitOne openFeePpm cap
+    uint256 internal constant MAX_FEE_BPS          = 1_000;    // open-fee cap for bps-denominated venues
+    uint256 internal constant MAX_FEE_PPM          = 100_000;  // 10% — open-fee cap for ppm-denominated venues
     uint256 internal constant MAX_HOUSE_CUT_PPM    = 500_000;  // 50% ceiling on the cut rate
     uint256 internal constant MIN_LEVERAGE_FLOOR   = 1;
     uint256 internal constant MAX_LEVERAGE_CEIL    = 10_000;
@@ -46,7 +45,7 @@ library ParamCatalog {
     error BadHouseCut();
     error BadDevBand();
 
-    /// @notice Owner-set, infrequent.
+    /// @notice Infrequent-cadence params.
     ///
     /// **Winnings cut.** The house rake on positive effective PnL is a per-token linear ramp on
     /// the position's PERCENT RETURN (`effPnl / collateral`), not on nominal profit — a nominal
@@ -68,7 +67,7 @@ library ParamCatalog {
         uint256 maxCutPpm;          // ceiling on the winnings-cut rate, ppm (≤ MAX_HOUSE_CUT_PPM)
     }
 
-    /// @notice Maker-set, frequent. Slippage scales are in `sizeUnits`, not 1e18.
+    /// @notice Frequent-cadence params. Slippage scales are in `sizeUnits`, not 1e18.
     struct Risk {
         uint256 openFeeBps;
         uint256 linearScale;        // larger ⇒ less linear slippage; type(uint256).max ⇒ off
@@ -137,7 +136,7 @@ library ParamCatalog {
         return effPnl * ratePpm / RATE_DENOM;
     }
 
-    /// @notice HitOne size-scaled open-fee rate (PPM). `N = notional / usdmDenom` (whole USDM):
+    /// @notice Size-scaled open-fee rate (PPM). `N = notional / usdmDenom` (whole USDM):
     ///   ppm = openFeePpm + linearScale·N / 1e6 + quadScale·N² / 1e12
     /// `linearScale`/`quadScale` read as "extra ppm at $1M notional" (linear ∝ N, quad ∝ N²) —
     /// the REF divisors are how fractional slopes are encoded: `linearScale = 100` is

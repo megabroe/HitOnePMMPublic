@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.27;
+
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {
+    IERC20Metadata
+} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {
+    ReentrancyGuard
+} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+
+import { IH2Market } from "./IH2Market.sol";
+import { IH2Oracle } from "./IH2Oracle.sol";
+import { IHighPrecisionTimestamp } from "../common/IHighPrecisionTimestamp.sol";
+
+/// @title H2Storage
+/// @notice Shared storage layout, constants, immutables, modifiers and helpers for the H2
+/// exchange. All state lives here so the layout is unambiguous across the inheritance tree.
+///
+/// There is deliberately NO Ownable, no halter, no pause and no timelock anywhere — the
+/// contract is immutable and ownerless. A market's frozen parameters and its oracles are
+/// the only authorities; the creator's only powers are setting the treasury's lending rate
+/// and withdrawing its surplus.
+abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
+    uint256 internal constant UNITS_CAP = 1 << 96;
+    uint256 internal constant PPM = 1_000_000;
+    uint256 internal constant WAD = 1e18; // funding-index fixed-point scale
+    /// @dev The ring's sentinel gap in ms (MarkRing.GAP_MAX_UNITS × GAP_UNIT_MS = 4095 × 1).
+    /// A mark older than this sits across a discontinuity the walk-back cannot replay.
+    uint256 internal constant MARK_RING_GAP_MAX_MS = 4_095;
+
+    /// @dev MegaETH high-precision-timestamp system contract (µs since epoch).
+    address internal constant HP_TIMESTAMP =
+        0x6342000000000000000000000000000000000002;
+
+    /// @dev Denominator for the annual funder rate: interest =
+    /// principal × ratePpm/1e6 × elapsed/365d.
+    uint256 internal constant YEAR = 365 days;
+
+    bytes32 internal constant ORDER_TYPEHASH =
+        keccak256(
+            "Order(address user,uint256 marketId,bool isLong,bool isOpen,uint256 size,uint256 leverage,"
+            "uint256 targetPrice,uint256 maxSlippageBps,uint64 deadline,uint256 channel,uint256 nonce)"
+        );
+
+    IERC20  public immutable override usdm;
+    uint256 internal immutable _usdmDenom;
+    IH2Oracle internal immutable _oracle;
+
+    // ---- markets (all frozen at createMarket) ----
+
+    mapping(uint256 => FeeParams)    internal _fees;
+    mapping(uint256 => RiskParams)   internal _risk;
+    mapping(uint256 => OracleParams) internal _oracles;
+    mapping(uint256 => address) internal _creatorOf;
+    mapping(uint256 => address) internal _tokenOf;
+    uint256 public override nextMarketId;
+
+    // ---- positions ----
+
+    /// @notice Packed to 6 slots. `realizedPnl` stores the EFFECTIVE PnL (pnl − funding −
+    /// close fee); the split is recoverable from the close events.
+    struct Position {
+        // Slot 0
+        address user;     // 20
+        uint64  openTime; // 8 — resets on increase (walk-back floor)
+        uint16  leverage; // 2
+        bool    isLong;   // 1
+        bool    closed;   // 1
+        // Slot 1
+        uint64  marketId;
+        uint64  closeTime;
+        uint64  expiresAt; // fixed at FIRST open; increases reset openTime but never this
+        uint64  openMs;    // HP-clock open stamp: the anti-stale-mark predicate compares it
+                           // against the FEED's lastPushMs like-for-like (fallback fills
+                           // publish nothing, so the feed's mark can predate the position)
+        // Slot 2
+        uint128 entryPrice; // priceUnits
+        uint128 size;       // sizeUnits
+        // Slot 3
+        uint128 closePrice; // priceUnits
+        uint128 col;        // USDM-wei
+        // Slot 4
+        int128  fundingCheckpoint;
+        int128  realizedPnl;
+        // Slot 5
+        uint128 notionalAtOpen; // USDM-wei
+        uint128 makerCutPaid;   // winnings cut (name kept for continuity)
+    }
+    mapping(uint256 => Position) internal _positions;
+    uint256 public override nextPositionId;
+
+    /// @notice One active position per (user, market).
+    mapping(address => mapping(uint256 => uint256)) public override activePositionId;
+    /// @notice usedNonce[user][channel][nonce].
+    mapping(address => mapping(uint256 => mapping(uint256 => bool))) public override nonceUsed;
+
+    mapping(uint256 => uint256) internal openInterestLong;
+    mapping(uint256 => uint256) internal openInterestShort;
+
+    // ---- treasury (index lending; see TREASURY_DESIGN.md) ----
+
+    /// @notice Per-market lending pool (see TREASURY_DESIGN.md). Packed to 3 slots.
+    /// `poolAssets` holds lender principal + retained trading P&L; lenders earn a fixed
+    /// rate accrued through the continuous `fundingIndex`. `lenderObligation =
+    /// totalPrincipal + accInterest + frozenOwed`; the creator withdraws `poolAssets −
+    /// obligation` as surplus.
+    struct MarketTreasury {
+        // Slot 0
+        uint128 poolAssets;      // lender principal + retained P&L
+        uint128 totalPrincipal;  // Σ principal of active (auto-rolling) deposits
+        // Slot 1
+        uint128 accInterest;     // Σ accrued interest of active deposits
+        uint128 frozenOwed;      // Σ (principal + term-end interest) of opted-out deposits
+        // Slot 2
+        uint128 fundingIndex;    // continuous cumulative-rate accumulator, WAD (1e18 = +100%)
+        uint64  lastAccruedAt;   // last _accrue timestamp
+        uint32  ratePpmAnnual;   // current-term rate (annual PPM); 0 = deposits closed
+        uint32  nextRatePpm;     // scheduled rate; == ratePpmAnnual when none pending
+    }
+    mapping(uint256 => MarketTreasury) internal _treasury;
+    /// @notice Optional hot/cold split, per CREATOR (covers all its markets); while unset
+    /// the creator is its own treasurer.
+    mapping(address => address) internal _treasurer;
+
+    /// @notice One lender deposit. Packed to 3 slots; deleted on withdrawal.
+    struct Deposit {
+        // Slot 0
+        address funder;      // 20
+        uint64  marketId;    // 8
+        bool    optedOut;    // 1 — disambiguates frozenIndex == 0 in a zero-rate market
+        // Slot 1
+        uint128 principal;
+        uint128 entryIndex;  // fundingIndex at deposit
+        // Slot 2
+        uint128 frozenIndex; // term-end index captured at opt-out; 0 while auto-rolling
+    }
+    mapping(uint256 => Deposit) internal _deposits;
+    uint256 internal _nextDepositId;
+
+    // ---- modifiers / role helpers ----
+
+    /// @dev The key currently authorized to run `creator`'s treasury.
+    function _effectiveTreasurer(address creator) internal view returns (address) {
+        address t = _treasurer[creator];
+        return t == address(0) ? creator : t;
+    }
+    modifier onlyTreasurer(address creator) {
+        if (msg.sender != _effectiveTreasurer(creator)) revert NotTreasurer();
+        _;
+    }
+    modifier onlyMarketTreasurer(uint256 marketId) {
+        address creator = _creatorOf[marketId];
+        if (creator == address(0)) revert UnknownMarket();
+        if (msg.sender != _effectiveTreasurer(creator)) revert NotTreasurer();
+        _;
+    }
+
+    constructor(address usdm_, address oracle_) {
+        if (usdm_ == address(0) || oracle_ == address(0)) revert ZeroAddress();
+        usdm = IERC20(usdm_);
+        _oracle = IH2Oracle(oracle_);
+        uint256 dec = uint256(IERC20Metadata(usdm_).decimals());
+        // Funding settles ÷1e18 while notional settles ÷usdmDenom; the two land in the
+        // same unit only for an 18-decimal settlement token. Refuse any other rather than
+        // mis-scale funding silently — the contract is immutable.
+        if (dec != 18) revert BadMarketParams();
+        _usdmDenom = 10 ** dec;
+    }
+
+    function oracle() external view override returns (address) {
+        return address(_oracle);
+    }
+
+    // ---- clocks ----
+
+    /// @dev µs wall-clock from MegaETH's system contract; block.timestamp fallback so
+    /// nothing bricks on the read (non-MegaETH chains, tests).
+    function _microTimestamp() internal view returns (uint256) {
+        (bool ok, bytes memory ret) = HP_TIMESTAMP.staticcall(
+            abi.encodeWithSelector(IHighPrecisionTimestamp.timestamp.selector)
+        );
+        if (ok && ret.length >= 32) return abi.decode(ret, (uint256));
+        return uint256(block.timestamp) * 1_000_000;
+    }
+
+    /// @dev Feed timestamps arrive on three scales (MegaETH RedStone pushes µs, pull
+    /// payloads ms, Chainlink-shape feeds s); normalize by magnitude before any staleness
+    /// comparison. Bands unambiguous until year ~5138.
+    function _updatedAtSecs(uint256 t) internal pure returns (uint256) {
+        if (t > 1e14) return t / 1_000_000;
+        if (t > 1e11) return t / 1_000;
+        return t;
+    }
+
+    // ---- tick helpers ----
+
+    function _toPriceUnits(uint256 input, uint256 priceTick) internal pure returns (uint128) {
+        if (input == 0 || input % priceTick != 0) revert BadMark();
+        uint256 pu = input / priceTick;
+        if (pu >= UNITS_CAP) revert BadMark();
+        return uint128(pu);
+    }
+    function _toSizeUnits(uint256 input, uint256 sizeTick) internal pure returns (uint128) {
+        if (input == 0 || input % sizeTick != 0) revert BadSize();
+        uint256 su = input / sizeTick;
+        if (su >= UNITS_CAP) revert BadSize();
+        return uint128(su);
+    }
+    function _priceOut(uint128 priceUnits, uint256 priceTick) internal pure returns (uint256) {
+        return uint256(priceUnits) * priceTick;
+    }
+    function _sizeOut(uint128 sizeUnits, uint256 sizeTick) internal pure returns (uint256) {
+        return uint256(sizeUnits) * sizeTick;
+    }
+    function _notional(uint128 priceUnits, uint128 sizeUnits, uint256 notionalScale)
+        internal pure returns (uint256)
+    {
+        return uint256(priceUnits) * uint256(sizeUnits) * notionalScale;
+    }
+}
