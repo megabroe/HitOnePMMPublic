@@ -47,6 +47,7 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
         uint32  refMaxStale;   // 4
         // Slot 5 (head of)
         uint64  maxRatePerSec; // frozen; enforced at push
+        uint32  feeRakePpm;    // frozen; operator's rake on consuming markets' earnings
     }
     mapping(uint256 => Feed) internal _feeds;
     mapping(uint256 => uint256[25]) internal _rings; // 25 = MarkRing.MARK_SLOT_COUNT
@@ -66,6 +67,7 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
         address operator,
         uint256 priceTick,
         uint64  maxRatePerSec,
+        uint32  feeRakePpm,
         address refFeed,
         uint8   refDecimals,
         uint32  refBandPpm,
@@ -75,6 +77,7 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
         if (priceTick == 0 || priceTick > type(uint128).max) revert BadFeedParams();
         if (maxRatePerSec == 0 || maxRatePerSec > uint64(uint256(int256(type(int64).max))))
             revert BadFeedParams();
+        if (feeRakePpm > 500_000) revert BadFeedParams(); // rake ≤ 50%
         if (refFeed != address(0)) {
             // A banded feed's guarantee must be meaningful: nonzero band ≤ 100%, bounded
             // staleness, decodable decimals.
@@ -89,11 +92,12 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
         f.operator      = operator;
         f.priceTick     = uint128(priceTick);
         f.maxRatePerSec = maxRatePerSec;
+        f.feeRakePpm    = feeRakePpm;
         f.refFeed     = refFeed;
         f.refDecimals = refDecimals;
         f.refBandPpm  = refBandPpm;
         f.refMaxStale = refMaxStale;
-        emit FeedCreated(feedId, operator, priceTick, maxRatePerSec, refFeed, refBandPpm);
+        emit FeedCreated(feedId, operator, priceTick, maxRatePerSec, feeRakePpm, refFeed, refBandPpm);
     }
 
     // ============================================================
@@ -237,6 +241,7 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
             operator:          f.operator,
             priceTick:         f.priceTick,
             maxRatePerSec:     f.maxRatePerSec,
+            feeRakePpm:        f.feeRakePpm,
             refFeed:           f.refFeed,
             refDecimals:       f.refDecimals,
             refBandPpm:        f.refBandPpm,

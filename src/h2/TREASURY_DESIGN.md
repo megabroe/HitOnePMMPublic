@@ -1,140 +1,133 @@
-# H2 treasury — index-based lending against the market's book
+# H2 treasury — permissionless share vault
 
-> **Implemented in `H2Treasury.sol`.** This replaced an earlier per-deposit
-> design (prepaid interest + per-deposit rolls + a junior tranche).
+> **Implemented in `H2Treasury.sol`.**
 
-A market is a book funded by lenders. There is no first-loss tranche, no
-donations, no creator-posted capital: the market is assumed profitable, and its
-trading winnings pay the lenders their rate. Lenders' principal *is* the
-backing capital the book pays winning traders out of, so lenders carry the
-market-making risk directly — compensated by a fixed rate, and bearing a
-principal haircut if the book loses more than it has made. Choosing which
-market to fund is choosing which operator you trust to run a profitable book.
+Each market is backed by its own **share vault**. Lenders deposit USDM and
+receive shares; a share is worth `poolAssets / totalShares`. All of the book's
+trading P&L — open/close fees, the winnings cut, trader losses, liquidation
+wipes, minus trader wins — flows through `poolAssets`, so the share price rises
+with the book's earnings and falls with its losses. The lenders **are** the
+counterparty to every trade: their capital is what winning traders are paid out
+of, and they hold the aggregate position the traders don't.
 
-## Roles and claims
+There is **no rate, no cap, and no creator/treasurer role** — nobody governs the
+vault, and nothing about it is mutable after the market is created. The only
+compensation carve-out is the **oracle rake**: the market's feed operator earns a
+frozen fraction of every pool gain. Choosing which market to fund is choosing
+which operator you trust to run a profitable book, and accepting the variance of
+being its house.
 
-- **Lenders** deposit USDM, locked until the next term boundary. Their principal
-  backs the book; they earn a fixed rate accrued through a shared index. They
-  are the senior claim on the pool (principal + accrued interest), but that
-  claim is only as good as the pool backs it.
-- **Creator** sets the rate (the one mutable market parameter) and is the
-  residual claimant: it may withdraw the pool's surplus above what lenders are
-  owed — the market's profit for running it. It posts no capital and holds no
-  first-loss buffer.
+## Shares and NAV
 
-## The index
-
-Interest accrues **continuously** through one per-market accumulator, and
-**withdrawal** is gated to fixed global term boundaries. The two are separate:
-the index makes the yield fair to anyone regardless of when they enter, and the
-boundaries give the market committed capital.
-
-Per market: `fundingIndex` (WAD-scaled), `ratePpmAnnual` (the rate, in annual
-PPM), `termSecs` (frozen — the expiry period, e.g. 30 days), `lastAccruedAt`.
-The index is a cumulative-rate accumulator advanced lazily; over a span of `dt`
-seconds it grows by the annual rate pro-rated to that span:
+The vault is standard ERC-4626-style share accounting with a virtual offset:
 
 ```
-_accrue():  fundingIndex  += ratePpmAnnual × WAD × dt / (PPM × YEAR)   // dt = now − lastAccruedAt
-            lastAccruedAt  = now
+deposit:   shares = assets · (totalShares + 1) / (poolAssets + 1)
+withdraw:  assets = burn   · (poolAssets  + 1) / (totalShares + 1)   // floored
+sharePrice = (poolAssets + 1) · WAD / (totalShares + 1)              // vaultOf view
 ```
 
-`_accrue()` runs on every deposit-touching call and on every rate change, so
-there is never an un-settled span, and one update covers every deposit — no
-per-deposit rolls. Accrual is per-second rather than per-term on purpose: a
-term-stepped index would let a lender deposit just before a boundary, harvest a
-whole term's interest, and leave — draining the pool at other lenders' expense.
-Continuous accrual pays each deposit exactly for the time its capital was at
-work.
+Both directions round in the vault's favor (mint floors shares in, redeem floors
+assets out), and the **`+1 / +1` virtual offset** neutralizes the classic
+first-depositor inflation attack: on an empty vault the first deposit mints
+proportionally rather than one wei of shares that could then be revalued by a
+donation. The floored redemption also means `assets ≤ poolAssets` for any single
+withdrawal, so a redeem can never underflow the pool.
 
-A deposit stores `principal`, `entryIndex` (the index when it entered), and an
-optional `frozenIndex`. Its accrued interest is:
+There is no separate accrual index. Because every share is a pro-rata claim on
+`poolAssets`, earnings and losses are reflected the instant they hit the pool —
+the NAV **is** the accumulator, so entry timing is fair by construction with no
+per-deposit bookkeeping.
+
+## Entry — immediate, at NAV
+
+`deposit(marketId, assets)` mints against the up-to-the-instant NAV and pulls the
+USDM in the same call. A mid-block joiner therefore buys in at the current price
+and can never harvest earnings that accrued before it arrived.
+
+Deposits require a **banded primary feed** (`refFeed != 0`); an unbanded deposit
+reverts `UnbandedFeed`. This is load-bearing for senior money: an operator whose
+feed is not checked against a reference could fabricate marks and drain the pool
+through a single fake round trip or a retroactive walk-back wipe. Requiring the
+band makes the mark stream trustworthy by construction before any lender capital
+is exposed to it.
+
+## Exit — unstake cooldown, redeem at current NAV
+
+Exit is two steps, gated by the market's frozen `unstakeSecs`:
+
+1. `requestUnstake(marketId, shares)` starts the cooldown clock. **The shares stay
+   in the pool** — they keep earning fees and keep bearing P&L through the whole
+   window. Re-requesting overwrites the prior request and resets the timer.
+2. `withdraw(marketId)`, once `block.timestamp ≥ unlockAt`, burns the requested
+   shares at the **current** NAV and transfers the USDM out. `CooldownActive`
+   before the clock; `NothingStaked` with no request.
+
+The cooldown is pure exit friction — it exists so a lender cannot pull capital
+opportunistically the instant the book takes an adverse position, not to change
+what a share is worth. Because redemption is always at the live NAV, waiting out
+the cooldown confers no timing advantage or disadvantage beyond the P&L the
+shares earn or lose while they wait. If the recorded request exceeds the holder's
+current balance (they moved shares elsewhere in the meantime), the burn is
+**clamped** to what they actually hold.
+
+## The oracle rake
+
+The feed operator's compensation is the rake, and it is the vault's only outflow
+that is not a lender redemption:
 
 ```
-interest    = principal × (activeIndex − entryIndex) / WAD
-activeIndex = frozenIndex if the lender has opted out, else the live fundingIndex
+_credit(marketId, amount):
+    rake          = amount · rakePpm / PPM          // gross — off the top of every gain
+    v.rakeOwed   += rake
+    v.poolAssets += amount − rake                   // remainder lifts share price
 ```
 
-### Terms, auto-roll, and opting out
+- `rakePpm` is **frozen at market creation**, copied from the feed's `feeRakePpm`
+  (which the oracle caps at 50%). It is never mutable.
+- The rake is **gross**: it is taken off every pool *gain* and the operator shares
+  in no *loss*. This is the deliberate asymmetry — the operator is paid for
+  running the price feed and the book, and the lenders, not the operator, are the
+  risk capital.
+- `claimRake(marketId, to)` transfers the accrued `rakeOwed` and may be called
+  **only by the current feed operator** (`NotFeedOperator` otherwise). The
+  recipient is read live from the feed, so it tracks the operator, not a stored
+  address.
 
-Term boundaries fall at fixed multiples of `termSecs` from a global epoch, so
-every deposit shares the same schedule (v1's "fixed expiration," not a
-per-deposit clock). A deposit is locked until the next boundary; while
-auto-roll is on (the default) it simply rolls into the next term at each
-boundary, still earning through the live index — no roll transaction, no
-re-lock action.
+## Settlement hooks
 
-To exit, a lender calls `stopRoll(depositId)`: interest freezes at the index
-value the deposit will hold at the **next term boundary** (`frozenIndex`), so it
-earns through the current term and no further, and its principal + frozen
-interest becomes withdrawable once that boundary passes — at any time
-afterward, with nothing to crank.
+The position paths settle against the vault through exactly two internal calls:
 
-### Updatable rate
+- **`_credit`** — every trading earning enters here (open/close fees, the winnings
+  cut, trader losses, liquidation wipes). It skims the rake and adds the remainder
+  to `poolAssets`, lifting the share price for lenders.
+- **`_drainPool`** — a trader win leaves here. It reverts `Insolvent` if
+  `poolAssets` cannot cover the payout, and otherwise subtracts it. **Opens are
+  never solvency-gated** — only payouts are — so a market can always take new risk;
+  it just cannot pay out more than it holds.
 
-`setRate(marketId, ratePpm)` (creator only, the one mutable market parameter)
-calls `_accrue()` first — settling the index at the old rate, which is never
-revalued — then schedules the new rate. While any lender is present it applies
-from the **next term boundary**, so the running term keeps the rate it was
-committed at (`_accrue` splits its span at the boundary and promotes
-`nextRatePpm` there); with no lenders it applies immediately. Setting the rate
-to 0 closes new deposits.
-
-## Solvency and the waterfall
-
-- `poolAssets` — the USDM the market holds: `Σ principal in + trading P&L
-  (open/close fees, funding inflows, liquidation wipes, trader losses) − trader
-  payouts − withdrawn principal − withdrawn interest − withdrawn surplus`. This
-  is exactly the pool the position paths already settle against.
-- `lenderObligation` — `totalPrincipal + accInterest + frozenOwed`, O(1) from
-  three aggregates. `totalPrincipal` and `accInterest` cover the active
-  (auto-rolling) deposits: `_accrue` advances `accInterest` by
-  `totalPrincipal · Δindex / WAD` each segment, so it always equals the active
-  deposits' interest to the second. `frozenOwed` holds opted-out deposits'
-  settled claims (principal + term-end interest); a `stopRoll` moves a deposit's
-  principal out of `totalPrincipal` and its full term-end obligation into
-  `frozenOwed`, so it no longer accrues.
-
-Rules:
-
-- **Trader win** — paid from `poolAssets`; reverts `Insolvent` if it cannot be
-  covered (unchanged from the current settlement path). Winning traders are
-  paid ahead of lender withdrawals in time, first-come — a documented
-  consequence, as today.
-- **Lender withdrawal** (opted out, past the boundary) — pays `min(principal +
-  interest, that deposit's pro-rata share of poolAssets)`. If the pool is short
-  (the book lost more than it earned), principal is haircut pro-rata across
-  lenders.
-- **Creator withdrawal** — may take `poolAssets − lenderObligation` when
-  positive, and no more: the residual (the market's profit above what lenders
-  are owed), never lender-owed capital. Withdrawal is free and immediate; there
-  is no mandated buffer or retention (the creator posts no capital and holds no
-  cushion — see the risk note below).
+A loss is a **pure NAV markdown** borne pro-rata by every share. There is no
+haircut mechanism, no first-loss tranche, and no waterfall: `poolAssets` simply
+falls, and the share price with it.
 
 ## The risk this design accepts (state plainly to lenders)
 
-Because the creator can withdraw all surplus and holds no buffer, lenders sit
-directly on the book with no cushion: the first loss beyond the market's
-accumulated winnings hits their principal, and a creator that has already
-withdrawn its profit does not claw it back. A lender is underwriting the
-operator's edge. The fixed rate is an accrual, not a guarantee — it is worth
-what the pool backs it for. Mitigations are the lender's own: fund markets with
-a demonstrated profitable history, and read `poolAssets` vs `lenderObligation`
-(both cheap views) before depositing and before each term rolls.
+Lenders are the **unhedged counterparty** to the market — the house. When traders
+are net long, the vault is net short, and vice versa; the vault holds the
+aggregate trader skew and marks it to the oracle every tick. The compensation for
+that variance is the edge: open/close fees plus the winnings cut on trader
+profits, net of the oracle rake. The exchange does **not** hedge on the lenders'
+behalf and holds no buffer for them — a lender who wants to neutralize the
+directional exposure must do it themselves, off-platform.
 
-## What the earlier design had that this drops
+The contract's one structural bound on that variance is the market's frozen
+**`maxOISkew`**: it caps how far net-long-minus-net-short the book can run, i.e.
+the largest directional position the vault can ever be forced to hold. Unlike a
+hedge it needs no trusted operator to enforce — it is a creation-time parameter
+checked on every open. Sizing it is the difference between "bounded house" and
+"unbounded directional bet."
 
-A junior `balance` seeded by the creator (`depositJuniorCapital` /
-`withdrawJuniorCapital`), a restore-first `_credit` waterfall, per-deposit
-prepaid-and-locked interest, and per-deposit `rollDeposit`. Here
-`_credit`/`_drainPool` are plain additions to / subtractions from `poolAssets`,
-and `funderOwed` / `funderAssets` are replaced by the index aggregates
-(`totalPrincipal`, `accInterest`, `frozenOwed`).
-
-## Settled
-
-- Interest accrual is **continuous** (per-second index), for fairness across
-  entry timing; terms are **fixed global expiries** every `termSecs`, shared
-  by all deposits, governing withdrawal only.
-- The creator withdraws surplus **freely, with no retention or cushion** — the
-  market is assumed profitable and lenders bear the downside by choice.
+Before depositing, and before each position they hold, lenders should read the
+cheap views: `vaultOf` (NAV, share price, pool size, rake terms) and `stakeOf`
+(their shares and any pending unstake). The share price is worth exactly what the
+book backs it for.

@@ -44,6 +44,7 @@ interface IH2Oracle {
         uint64  maxRatePerSec;     // frozen magnitude cap on both funding rates — enforced
                                    // at PUSH, because indices integrate history and no
                                    // consumer can retroactively cap what already accrued
+        uint32  feeRakePpm;        // the operator's cut of consuming markets' earnings (PPM)
         address refFeed;           // AggregatorV3-shaped reference; 0 = unbanded feed
         uint8   refDecimals;
         uint32  refBandPpm;        // |mark − ref| ≤ band (PPM of ref)
@@ -68,6 +69,7 @@ interface IH2Oracle {
         address indexed operator,
         uint256 priceTick,
         uint64  maxRatePerSec,
+        uint32  feeRakePpm,
         address refFeed,
         uint32  refBandPpm
     );
@@ -105,10 +107,13 @@ interface IH2Oracle {
     /// @notice Create a feed. Permissionless; every argument is frozen forever. Pass
     /// `refFeed = 0` for an unbanded feed (ring history then carries no sanity guarantee —
     /// consumers should require a banded feed before accepting third-party funds).
+    /// `feeRakePpm` (≤ 500_000) is the operator's cut of the earnings of every market that
+    /// consumes this feed — the operator's compensation, paid to `operator`.
     function createFeed(
         address operator,
         uint256 priceTick,
         uint64  maxRatePerSec,
+        uint32  feeRakePpm,
         address refFeed,
         uint8   refDecimals,
         uint32  refBandPpm,

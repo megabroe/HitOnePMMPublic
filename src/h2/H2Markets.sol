@@ -13,9 +13,9 @@ import { FundingIndex } from "../common/FundingIndex.sol";
 abstract contract H2Markets is H2Storage {
     // ---- Market creation ----
 
-    /// @notice Permissionless. `msg.sender` becomes the market's creator (treasury
-    /// rate-setter and surplus claimant) forever; every parameter is validated once and then
-    /// frozen. Changing anything means creating a successor market and letting this one run off.
+    /// @notice Permissionless. `msg.sender` is recorded as the market's creator (identity
+    /// only — the treasury is a role-less share vault); every parameter is validated once and
+    /// then frozen. Changing anything means creating a successor market and letting this run off.
     function createMarket(
         address token,
         FeeParams calldata fees_,
@@ -50,7 +50,7 @@ abstract contract H2Markets is H2Storage {
         if (r.maxOIGross == 0) r.maxOIGross = type(uint128).max;
         if (r.maxOISkew == 0)  r.maxOISkew  = type(uint128).max;
         if (r.liqWidthPpm > 100_000) revert BadMarketParams(); // early-trigger width ≤ 10%
-        if (r.termSecs < 1 hours || r.termSecs > 365 days) revert BadMarketParams();
+        if (r.unstakeSecs > 30 days) revert BadMarketParams(); // 0 = no cooldown; ≤ 30 d
         // staleSpreadK is ppm per √ms; at the sentinel gap (√4095 ≈ 64) the bound below
         // keeps the max self-service spread ≤ ~20% (64 × 3125 ≈ 200_000 ppm). 0 disables
         // executeAtMark for the market.
@@ -95,9 +95,8 @@ abstract contract H2Markets is H2Storage {
         _oracles[marketId]   = o;
         _creatorOf[marketId] = msg.sender;
         _tokenOf[marketId]   = token;
-        // Rate starts at 0 (deposits closed until the creator calls setRate); anchor the
-        // accrual clock so the first _accrue integrates from creation, not from epoch 0.
-        _treasury[marketId].lastAccruedAt = uint64(block.timestamp);
+        // Cache the primary feed's rake — the operator's frozen cut of this market's earnings.
+        _vault[marketId].rakePpm = uint32(feed.feeRakePpm);
         emit MarketCreated(marketId, msg.sender, token, f, r, o);
     }
 

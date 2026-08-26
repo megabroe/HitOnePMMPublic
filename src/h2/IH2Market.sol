@@ -62,8 +62,8 @@ interface IH2Market {
                                       // so the full knockout lands BEFORE bankruptcy
         uint64  fundingRateCapPerSec; // cap on the feed's rates at consumption (100·2⁶³ scale)
         uint32  maxSpreadPpm;         // cap on the feed's spread oracle; 0 = ignore it
-        uint32  termSecs;             // lending term / expiry period: deposits withdraw at its
-                                      // boundaries and the rate applies per term ([1h, 365d])
+        uint32  unstakeSecs;          // share-vault withdrawal cooldown ([0, 30d]); shares keep
+                                      // earning through it — pure exit friction
         uint32  staleSpreadK;         // self-service staleness-spread coefficient, ppm per
                                       // √millisecond of mark age (≈ 2σ); 0 disables
                                       // executeAtMark for this market
@@ -144,29 +144,21 @@ interface IH2Market {
         uint256 payoutReceived;
     }
 
-    /// @notice A market's lending pool, projected to now.
-    struct TreasuryView {
-        uint256 poolAssets;        // lender principal + retained P&L
-        uint256 totalPrincipal;    // active principal
-        uint256 accInterest;       // active accrued interest (projected)
-        uint256 frozenOwed;        // opted-out claims (principal + term-end interest)
-        uint256 lenderObligation;  // totalPrincipal + accInterest + frozenOwed
-        uint256 surplus;           // max(0, poolAssets − obligation) — the creator's
-        uint256 fundingIndex;      // projected
-        uint256 ratePpmAnnual;     // current-term rate; 0 = deposits closed
-        uint256 nextRatePpm;       // scheduled rate
-        address treasurer;         // per creator; creator itself while unset
+    /// @notice A market's share vault.
+    struct VaultView {
+        uint256 totalShares;
+        uint256 poolAssets;     // USDM backing the shares (post-rake)
+        uint256 sharePrice;     // poolAssets per share, 1e18-scaled (virtual-offset)
+        uint256 rakeOwed;       // feed operator's accrued rake, claimable
+        address rakeRecipient;  // the feed operator
+        uint256 rakePpm;        // the feed's frozen rake
     }
 
-    struct DepositView {
-        address funder;
-        uint256 marketId;
-        uint256 principal;
-        uint256 entryIndex;
-        uint256 frozenIndex;   // 0 while auto-rolling
-        bool    optedOut;
-        uint256 value;         // principal + interest (to now if active, else frozen)
-        bool    withdrawable;  // opted out and the term boundary has passed
+    /// @notice A user's stake in a market's vault.
+    struct StakeView {
+        uint256 shares;         // total shares held
+        uint256 unstakeShares;  // shares in a pending unstake (0 if none)
+        uint64  unlockAt;       // when the pending unstake can be withdrawn (0 if none)
     }
 
     // ============================================================
@@ -238,19 +230,14 @@ interface IH2Market {
     event FallbackExecuted(uint256 indexed marketId, uint256 indexed positionId, uint256 oraclePrice, uint256 fillPrice);
     event FallbackLiquidated(uint256 indexed marketId, uint256 oraclePrice, uint256 count);
 
-    // ---- treasury (index lending — see TREASURY_DESIGN.md) ----
+    // ---- treasury: share vault (see TREASURY_DESIGN.md) ----
 
-    event TreasurerSet(address indexed creator, address indexed treasurer);
-    /// @notice `immediate` is true when the change applied at once (no active lenders), else
-    /// it activates at the next term boundary.
-    event RateSet(uint256 indexed marketId, uint256 ratePpm, bool immediate);
-    event FundDeposited(uint256 indexed depositId, uint256 indexed marketId, address indexed funder, uint256 principal);
-    /// @notice A lender opted out of the roll: interest is frozen at `owed` (principal +
-    /// term-end interest) and becomes withdrawable once the term boundary passes.
-    event FundOptedOut(uint256 indexed depositId, uint256 owed, uint128 frozenIndex);
-    /// @notice `paid` may be below the owed amount — the haircut ratio at withdrawal is baked in.
-    event FundWithdrawn(uint256 indexed depositId, address indexed to, uint256 paid);
-    event SurplusWithdrawn(uint256 indexed marketId, address indexed to, uint256 amount);
+    event Deposited(uint256 indexed marketId, address indexed user, uint256 assets, uint256 shares);
+    /// @notice A lender started the withdrawal cooldown; the shares keep earning until withdrawn.
+    event UnstakeRequested(uint256 indexed marketId, address indexed user, uint256 shares, uint64 unlockAt);
+    event Withdrawn(uint256 indexed marketId, address indexed user, uint256 shares, uint256 assets);
+    /// @notice The feed operator claimed the market's accrued rake.
+    event RakeClaimed(uint256 indexed marketId, address indexed to, uint256 amount);
 
     // ============================================================
     // errors
@@ -260,7 +247,6 @@ interface IH2Market {
     error UnknownMarket();
     error NotOracle();         // onMark caller is not the H2Oracle
     error FeedMismatch();      // callback feed is not the market's primary feed
-    error NotTreasurer();
 
     error BadLeverage();
     error BadSize();
@@ -292,15 +278,12 @@ interface IH2Market {
     error OracleBadAnswer();
     error PrimaryNeverPushed();    // no mark exists (expiry/settlement refuse a zero mark)
 
-    // treasury
-    error DepositsClosed();  // rate is 0 — the creator has closed deposits
-    error UnknownDeposit();
-    error NotFunder();
-    error AlreadyOptedOut();
-    error NotOptedOut();     // withdraw requires opting out first
-    error TermNotEnded();    // opted out but the term boundary has not passed
-    error UnbandedFeed();    // deposits require a banded primary feed (ring integrity)
-    error NoSurplus();       // creator withdrawal exceeds poolAssets − lenderObligation
+    // treasury (share vault)
+    error UnbandedFeed();     // deposits require a banded primary feed (ring integrity)
+    error InsufficientShares(); // unstake request exceeds shares held
+    error NothingStaked();    // no pending unstake to withdraw
+    error CooldownActive();   // withdraw before the unstake cooldown elapsed
+    error NotFeedOperator();  // claimRake caller is not the primary feed's operator
     error ZeroAddress();
     error ZeroAmount();
 
@@ -308,9 +291,9 @@ interface IH2Market {
     // markets
     // ============================================================
 
-    /// @notice Create a market. Permissionless; `msg.sender` becomes the creator (the
-    /// treasury's rate-setter and surplus claimant) forever. All three param structs are
-    /// validated then frozen. Structural rules beyond field bounds:
+    /// @notice Create a market. Permissionless; `msg.sender` is recorded as the creator
+    /// (identity only — the treasury is a role-less share vault). All three param structs
+    /// are validated then frozen. Structural rules beyond field bounds:
     ///  - the market's `priceTick` must equal the primary feed's tick;
     ///  - the ANTI-SANDWICH bound: `openFlatPpm + closeFlatPpm ≥ maxDeviationPpm` — the
     ///    minimum round-trip cost must exceed the worst oracle disagreement the gate
@@ -386,40 +369,31 @@ interface IH2Market {
     function expirePosition(uint256 id) external;
 
     // ============================================================
-    // treasury — index lending (see TREASURY_DESIGN.md)
+    // treasury — permissionless share vault (see TREASURY_DESIGN.md)
     // ============================================================
 
-    /// @notice The key authorized for a creator's treasury ops (rate, surplus). Creator
-    /// itself while unset.
-    function setTreasurer(address creator, address treasurer) external;
+    /// @notice Lend USDM into the market's vault; mints shares at the current NAV. All
+    /// trading P&L (after the feed's rake) flows to share price. Permissionless and
+    /// immediate. Requires a banded primary feed (`UnbandedFeed`) for ring integrity.
+    function deposit(uint256 marketId, uint256 assets) external returns (uint256 shares);
 
-    /// @notice Set the market's annual funder rate (PPM) — the one mutable market
-    /// parameter. Applies from the next term boundary while lenders are present (so a
-    /// running term keeps its rate); applies immediately when there are none. `0` closes
-    /// deposits. Treasurer only.
-    function setRate(uint256 marketId, uint256 ratePpm) external;
+    /// @notice Begin the withdrawal cooldown on `shares`. They STAY in the pool and keep
+    /// earning + bearing P&L until `withdraw`; the cooldown (`unstakeSecs`) is exit friction
+    /// only. Re-requesting resets the timer. Reverts `InsufficientShares`.
+    function requestUnstake(uint256 marketId, uint256 shares) external;
 
-    /// @notice Withdraw the market's surplus (`poolAssets − lenderObligation`) — the
-    /// creator's profit. Treasurer only; reverts `NoSurplus` past the obligation line.
-    function withdrawSurplus(uint256 marketId, uint256 amount, address to) external;
+    /// @notice Withdraw a matured unstake: burns the requested shares at the CURRENT NAV and
+    /// pays out. Reverts `NothingStaked` / `CooldownActive`.
+    function withdraw(uint256 marketId) external returns (uint256 assets);
 
-    /// @notice Lend USDM into the market. Principal backs the book and earns the fixed rate
-    /// through the shared index; auto-rolls each term until `stopRoll`. Requires a banded
-    /// primary feed (`UnbandedFeed`) and an open rate (`DepositsClosed`).
-    function depositFund(uint256 marketId, uint256 amount) external returns (uint256 depositId);
+    /// @notice Claim the market's accrued rake. Only the primary feed's operator; `to`
+    /// receives the full `rakeOwed`.
+    function claimRake(uint256 marketId, address to) external;
 
-    /// @notice Opt out of the roll (deposit's funder only): interest freezes at the term-end
-    /// index, and principal + that interest becomes withdrawable once the boundary passes.
-    function stopRoll(uint256 depositId) external;
-
-    /// @notice Withdraw an opted-out deposit past its term boundary: pays principal +
-    /// frozen interest, pro-rata haircut if the pool is short. Deletes the deposit.
-    function withdrawFund(uint256 depositId, address to) external;
-
-    function treasuryOf(uint256 marketId) external view returns (TreasuryView memory);
-    function deposits(uint256 depositId) external view returns (DepositView memory);
-    /// @notice The market's open notional (long + short OI) — the exposure its own
-    /// treasury backs. View only; opens are deliberately not solvency-gated.
+    function vaultOf(uint256 marketId) external view returns (VaultView memory);
+    function stakeOf(uint256 marketId, address user) external view returns (StakeView memory);
+    /// @notice The market's open notional (long + short OI) — the exposure its vault backs.
+    /// View only; opens are deliberately not solvency-gated.
     function grossOpenNotional(uint256 marketId) external view returns (uint256);
 
     // ============================================================

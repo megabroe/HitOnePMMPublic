@@ -33,7 +33,8 @@ contract H2OracleTest is Test {
     MockAggregatorV3 internal ref;
     address internal op = makeAddr("operator");
 
-    uint64 internal constant RATE_CAP = 2_560_000_000_000_000; // ~1%/hour
+    uint64 internal constant RATE_CAP = 2_560_000_000_000_000;
+    uint32  internal constant RAKE_PPM = 150_000; // 15% oracle rake // ~1%/hour
     uint256 internal _t;
     function _adv(uint64 dt) internal { _t += dt; vm.warp(_t); }
 
@@ -46,7 +47,7 @@ contract H2OracleTest is Test {
 
     function _bandedFeed() internal returns (uint256 id) {
         vm.prank(op);
-        id = oracle.createFeed(op, 1e18, RATE_CAP, address(ref), 8, 100_000, 1 hours); // 10% band
+        id = oracle.createFeed(op, 1e18, RATE_CAP, RAKE_PPM, address(ref), 8, 100_000, 1 hours); // 10% band
     }
 
     function test_createFeedFreezesParams() public {
@@ -61,7 +62,7 @@ contract H2OracleTest is Test {
     function test_unbandedFeedRejectsBandFields() public {
         vm.prank(op);
         vm.expectRevert(IH2Oracle.BadFeedParams.selector);
-        oracle.createFeed(op, 1e18, RATE_CAP, address(0), 0, 100_000, 0); // band with no feed
+        oracle.createFeed(op, 1e18, RATE_CAP, RAKE_PPM, address(0), 0, 100_000, 0); // band with no feed
     }
 
     function test_onlyOperatorPushes() public {

@@ -30,8 +30,8 @@ contract H2MarketTest is Test {
     uint256 internal feedId;
     uint256 internal mkt;
 
-    uint64  internal constant RATE_CAP = 1_500_000_000_000_000; // passes coupled ceiling
-    uint256 internal constant RATE_10PCT = 100_000;
+    uint64  internal constant RATE_CAP = 1_500_000_000_000_000;
+    uint32  internal constant RAKE_PPM = 150_000; // 15% oracle rake // passes coupled ceiling
     uint256 internal constant TERM = 30 days;
 
     bytes32 internal DOMAIN_SEPARATOR;
@@ -43,16 +43,22 @@ contract H2MarketTest is Test {
     uint256 internal _t;
     function _adv(uint256 dt) internal { _t += dt; vm.warp(_t); }
 
-    /// @dev Open a market's deposits (creator sets the rate) and back its pool with lender
-    /// capital from carl — the index-lending replacement for the old junior seed.
+    /// @dev Back a market's share vault with `amount` of USDM from carl (the sole LP).
     function _seedTreasury(uint256 marketId, uint256 amount) internal {
-        vm.prank(h.creatorOf(marketId));
-        h.setRate(marketId, RATE_10PCT);
         usdm.mint(carl, amount);
         vm.startPrank(carl);
         usdm.approve(address(h), type(uint256).max);
-        h.depositFund(marketId, amount);
+        h.deposit(marketId, amount);
         vm.stopPrank();
+    }
+
+    /// @dev A flat open+close round trip that banks fees into the vault (via `_credit`).
+    function _roundTrip() internal {
+        uint256 id = _openLong(alicePk, 1e18, 100, 50_000e18, 0);
+        _adv(1);
+        IH2Market.Order memory c = _order(alicePk, true, false, 1e18, 0, 49_800e18, 200, 1);
+        _pushOrder(50_000e18, c, _sign(alicePk, c), 0);
+        require(h.positions(id).closed, "round trip did not close");
     }
 
     function _fees() internal pure returns (IH2Market.FeeParams memory) {
@@ -72,7 +78,7 @@ contract H2MarketTest is Test {
             liqWidthPpm: liqWidthPpm,
             fundingRateCapPerSec: RATE_CAP,
             maxSpreadPpm: 5_000, // ≤ 0.5% operator spread
-            termSecs: uint32(TERM),
+            unstakeSecs: uint32(TERM),
             staleSpreadK: 6 // ppm per √ms ≈ 2σ for BTC (≈356 ppm at the 4s sentinel)
         });
     }
@@ -102,7 +108,7 @@ contract H2MarketTest is Test {
         token = makeAddr("btc");
 
         vm.prank(op);
-        feedId = oracle.createFeed(op, 1e18, RATE_CAP, address(ref), 8, 100_000, 1 hours);
+        feedId = oracle.createFeed(op, 1e18, RATE_CAP, RAKE_PPM, address(ref), 8, 100_000, 1 hours);
 
         vm.prank(op);
         mkt = h.createMarket(token, _fees(), _risk(0), _oracleParams());
@@ -476,44 +482,36 @@ contract H2MarketTest is Test {
     }
 
     // ============================================================
-    // treasury (interim) — unbanded-feed deposit gate + waterfall
+    // treasury — permissionless share vault
     // ============================================================
 
-    function test_depositFundRequiresBandedFeed() public {
-        // Stand up an unbanded feed + market.
+    function test_depositRequiresBandedFeed() public {
         vm.prank(op);
-        uint256 ufeed = oracle.createFeed(op, 1e18, RATE_CAP, address(0), 0, 0, 0);
+        uint256 ufeed = oracle.createFeed(op, 1e18, RATE_CAP, RAKE_PPM, address(0), 0, 0, 0);
         IH2Market.OracleParams memory op_ = _oracleParams();
         op_.primaryFeedId = uint64(ufeed);
         vm.prank(op);
         uint256 umkt = h.createMarket(token, _fees(), _risk(0), op_);
-        // The banding gate precedes the rate/deposits-open check, so an unbanded market
-        // rejects deposits whether or not the creator has set a rate.
-        vm.prank(op);
-        h.setRate(umkt, RATE_10PCT);
         usdm.mint(carl, 100e18);
         vm.startPrank(carl);
         usdm.approve(address(h), type(uint256).max);
         vm.expectRevert(IH2Market.UnbandedFeed.selector);
-        h.depositFund(umkt, 100e18);
+        h.deposit(umkt, 100e18);
         vm.stopPrank();
     }
 
-    function test_fundDepositAndInvariant() public {
-        // setUp already seeded 5M of lender principal into mkt; add another deposit.
-        IH2Market.TreasuryView memory t0 = h.treasuryOf(mkt);
-        usdm.mint(carl, 100_000e18);
+    function test_depositMintsSharesAtNav() public {
+        // setUp deposited 5M from carl at NAV 1. A second equal deposit mints equal shares.
+        IH2Market.VaultView memory v0 = h.vaultOf(mkt);
+        usdm.mint(carl, 5_000_000e18);
         vm.prank(carl);
-        h.depositFund(mkt, 100_000e18);
-
-        IH2Market.TreasuryView memory t = h.treasuryOf(mkt);
-        // No time has passed, so nothing has accrued: obligation is exactly principal, and
-        // the pool backs it to the wei with zero surplus.
-        assertEq(t.totalPrincipal, t0.totalPrincipal + 100_000e18);
-        assertEq(t.accInterest, 0);
-        assertEq(t.lenderObligation, t.totalPrincipal);
-        assertEq(t.poolAssets, t.lenderObligation);
-        assertEq(t.surplus, 0);
+        uint256 sh = h.deposit(mkt, 5_000_000e18);
+        IH2Market.VaultView memory v = h.vaultOf(mkt);
+        assertEq(v.poolAssets, v0.poolAssets + 5_000_000e18, "pool grew by deposit");
+        assertEq(sh, 5_000_000e18, "NAV 1 => shares == assets");
+        assertEq(v.totalShares, v0.totalShares + sh);
+        assertEq(v.rakePpm, RAKE_PPM, "rake cached from feed");
+        assertEq(v.rakeRecipient, op, "rake recipient = feed operator");
     }
 
     // ---- walk-back time floor under sub-second (production) mark cadence ----
@@ -541,7 +539,7 @@ contract H2MarketTest is Test {
     /// after it opened.
     function test_walkBackExcludesPreOpenMarksUnderSubSecondCadence() public {
         vm.prank(op);
-        uint256 fid = oracle.createFeed(op, 1e18, RATE_CAP, address(ref), 8, 100_000, 1 hours);
+        uint256 fid = oracle.createFeed(op, 1e18, RATE_CAP, RAKE_PPM, address(ref), 8, 100_000, 1 hours);
         IH2Market.OracleParams memory op_ = _oracleParams();
         op_.primaryFeedId = uint64(fid);
         vm.prank(op);
@@ -592,7 +590,7 @@ contract H2MarketTest is Test {
     /// not over-correct into never liquidating from history).
     function test_walkBackStillLiquidatesPostOpenBreach() public {
         vm.prank(op);
-        uint256 fid = oracle.createFeed(op, 1e18, RATE_CAP, address(ref), 8, 100_000, 1 hours);
+        uint256 fid = oracle.createFeed(op, 1e18, RATE_CAP, RAKE_PPM, address(ref), 8, 100_000, 1 hours);
         IH2Market.OracleParams memory op_ = _oracleParams();
         op_.primaryFeedId = uint64(fid);
         vm.prank(op);
@@ -636,74 +634,109 @@ contract H2MarketTest is Test {
         assertTrue(h.positions(id).closed, "post-open breach must still liquidate");
     }
 
-    function test_setRateDefersWhileFunded() public {
-        // mkt carries 5M of principal (setUp), so a rate change waits for the term boundary.
-        IH2Market.TreasuryView memory t0 = h.treasuryOf(mkt);
-        assertEq(t0.ratePpmAnnual, RATE_10PCT);
-        assertEq(t0.nextRatePpm, RATE_10PCT);
-
+    function test_firstDepositVirtualOffsetSanity() public {
+        // A fresh market: first deposit mints shares == assets, share price is exactly 1e18.
         vm.prank(op);
-        h.setRate(mkt, 200_000); // 20%
-        IH2Market.TreasuryView memory t1 = h.treasuryOf(mkt);
-        assertEq(t1.ratePpmAnnual, RATE_10PCT); // current term keeps its rate
-        assertEq(t1.nextRatePpm, 200_000);      // pending until the boundary
+        uint256 m = h.createMarket(token, _fees(), _risk(0), _oracleParams());
+        usdm.mint(carl, 1_000e18);
+        vm.prank(carl);
+        uint256 sh = h.deposit(m, 1_000e18);
+        IH2Market.VaultView memory v = h.vaultOf(m);
+        assertEq(sh, 1_000e18, "first deposit: shares == assets");
+        assertEq(v.totalShares, 1_000e18);
+        assertEq(v.poolAssets, 1_000e18);
+        assertEq(v.sharePrice, 1e18, "NAV exactly 1.0");
+    }
 
-        // Cross the boundary and touch the treasury: _accrue promotes the pending rate.
+    function test_requestUnstakeRejectsOverBalance() public {
+        uint256 shares = h.stakeOf(mkt, carl).shares;
+        vm.prank(carl);
+        vm.expectRevert(IH2Market.InsufficientShares.selector);
+        h.requestUnstake(mkt, shares + 1);
+    }
+
+    function test_unstakeCooldownThenWithdrawAtNav() public {
+        uint256 shares = h.stakeOf(mkt, carl).shares;
+        vm.prank(carl);
+        h.requestUnstake(mkt, shares);
+        IH2Market.StakeView memory st = h.stakeOf(mkt, carl);
+        assertEq(st.unstakeShares, shares);
+        assertEq(st.unlockAt, uint64(block.timestamp) + uint32(TERM));
+
+        // Cooldown not elapsed ⇒ withdraw reverts.
+        vm.prank(carl);
+        vm.expectRevert(IH2Market.CooldownActive.selector);
+        h.withdraw(mkt);
+
         _adv(TERM);
-        usdm.mint(carl, 1e18);
+        uint256 bal0 = usdm.balanceOf(carl);
         vm.prank(carl);
-        h.depositFund(mkt, 1e18);
-        IH2Market.TreasuryView memory t2 = h.treasuryOf(mkt);
-        assertEq(t2.ratePpmAnnual, 200_000);
-        assertEq(t2.nextRatePpm, 200_000);
+        uint256 got = h.withdraw(mkt);
+        assertEq(usdm.balanceOf(carl) - bal0, got, "paid out");
+        assertApproxEqAbs(got, 5_000_000e18, 1, "~ full NAV back, no PnL");
+        assertEq(h.stakeOf(mkt, carl).shares, 0, "shares burned");
     }
 
-    function test_stopRollWithdrawHaircutsUnfundedInterest() public {
-        // carl's setUp deposit is id 1. Opt out mid-term.
-        _adv(2 days);
+    function test_unstakingSharesKeepEarningThroughCooldown() public {
+        uint256 shares = h.stakeOf(mkt, carl).shares;
         vm.prank(carl);
-        h.stopRoll(1);
-
-        // Withdrawal is refused until the term boundary the freeze targeted has passed.
+        h.requestUnstake(mkt, shares);
+        // A round trip lands DURING the cooldown; the unstaking shares still capture the fees.
+        _roundTrip();
+        _adv(TERM);
         vm.prank(carl);
-        vm.expectRevert(IH2Market.TermNotEnded.selector);
-        h.withdrawFund(1, carl);
-
-        _adv(TERM); // safely past the next global boundary
-        vm.prank(carl);
-        h.withdrawFund(1, carl);
-        // The pool earned no trading P&L, so the promised interest is unfunded: carl
-        // recovers principal exactly and the pool is drained to zero.
-        assertEq(usdm.balanceOf(carl), 5_000_000e18);
-        assertEq(h.treasuryOf(mkt).poolAssets, 0);
-        vm.expectRevert(IH2Market.UnknownDeposit.selector);
-        h.deposits(1);
+        uint256 got = h.withdraw(mkt);
+        assertGt(got, 5_000_000e18, "cooldown shares earned the interim fees - no dodge");
     }
 
-    function test_withdrawSurplusTakesProfitOnly() public {
-        // A flat round trip leaves alice's fees + spread in the pool as surplus.
+    function test_lossMarksDownNavNoHaircut() public {
+        // Alice longs, the mark rises, she closes in profit — the pool pays her, NAV drops.
         uint256 id = _openLong(alicePk, 1e18, 100, 50_000e18, 0);
         _adv(1);
-        IH2Market.Order memory c = _order(alicePk, true, false, 1e18, 0, 49_800e18, 200, 1);
-        _pushOrder(50_000e18, c, _sign(alicePk, c), 0);
+        IH2Market.Order memory c = _order(alicePk, true, false, 1e18, 0, 50_500e18, 200, 1);
+        _pushOrder(51_000e18, c, _sign(alicePk, c), 0);
         assertTrue(h.positions(id).closed);
 
-        IH2Market.TreasuryView memory t = h.treasuryOf(mkt);
-        assertGt(t.surplus, 0);
-        assertEq(t.surplus, t.poolAssets - t.lenderObligation);
+        IH2Market.VaultView memory v = h.vaultOf(mkt);
+        assertLt(v.poolAssets, 5_000_000e18, "pool paid the winner");
 
-        uint256 before = usdm.balanceOf(op);
-        vm.prank(op);
-        h.withdrawSurplus(mkt, t.surplus, op);
-        assertEq(usdm.balanceOf(op), before + t.surplus);
-
-        // Nothing left above the lender obligation.
-        vm.prank(op);
-        vm.expectRevert(IH2Market.NoSurplus.selector);
-        h.withdrawSurplus(mkt, 1, op);
+        uint256 shares = h.stakeOf(mkt, carl).shares;
+        vm.prank(carl);
+        h.requestUnstake(mkt, shares);
+        _adv(TERM);
+        uint256 bal0 = usdm.balanceOf(carl);
+        vm.prank(carl);
+        uint256 got = h.withdraw(mkt);
+        assertEq(usdm.balanceOf(carl) - bal0, got);
+        assertLt(got, 5_000_000e18, "LP bore the loss via NAV markdown, in full (no haircut)");
+        assertApproxEqAbs(got, v.poolAssets, 1, "redeemed the whole pool");
     }
 
-    function test_cancelNonceRetiresOrder() public {
+    function test_rakeSkimsGrossAndOperatorClaims() public {
+        IH2Market.VaultView memory v0 = h.vaultOf(mkt);
+        assertEq(v0.rakeOwed, 0);
+        _roundTrip(); // banks fees: 15% to rake, 85% to the pool
+
+        IH2Market.VaultView memory v = h.vaultOf(mkt);
+        assertGt(v.rakeOwed, 0, "rake accrued");
+        // rake:poolGrowth == 15:85 (per-credit rounding aside).
+        uint256 poolGrowth = v.poolAssets - v0.poolAssets;
+        assertApproxEqRel(v.rakeOwed * 850_000, poolGrowth * 150_000, 1e12, "15/85 split");
+
+        // Non-operator cannot claim.
+        vm.prank(carl);
+        vm.expectRevert(IH2Market.NotFeedOperator.selector);
+        h.claimRake(mkt, carl);
+
+        // Operator claims the full accrued rake.
+        uint256 bal0 = usdm.balanceOf(op);
+        vm.prank(op);
+        h.claimRake(mkt, op);
+        assertEq(usdm.balanceOf(op) - bal0, v.rakeOwed, "claimed full rake");
+        assertEq(h.vaultOf(mkt).rakeOwed, 0, "rake zeroed");
+    }
+
+        function test_cancelNonceRetiresOrder() public {
         vm.prank(alice);
         h.cancelNonce(0, 7);
         _adv(1);

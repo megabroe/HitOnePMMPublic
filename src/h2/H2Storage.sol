@@ -20,12 +20,12 @@ import { IHighPrecisionTimestamp } from "../common/IHighPrecisionTimestamp.sol";
 ///
 /// There is deliberately NO Ownable, no halter, no pause and no timelock anywhere — the
 /// contract is immutable and ownerless. A market's frozen parameters and its oracles are
-/// the only authorities; the creator's only powers are setting the treasury's lending rate
-/// and withdrawing its surplus.
+/// the only authorities. The treasury is a permissionless share vault: nobody has any role
+/// over it — not even the market creator.
 abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
     uint256 internal constant UNITS_CAP = 1 << 96;
     uint256 internal constant PPM = 1_000_000;
-    uint256 internal constant WAD = 1e18; // funding-index fixed-point scale
+    uint256 internal constant WAD = 1e18; // 1e18 fixed-point (share-price scale)
     /// @dev The ring's sentinel gap in ms (MarkRing.GAP_MAX_UNITS × GAP_UNIT_MS = 4095 × 1).
     /// A mark older than this sits across a discontinuity the walk-back cannot replay.
     uint256 internal constant MARK_RING_GAP_MAX_MS = 4_095;
@@ -33,10 +33,6 @@ abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
     /// @dev MegaETH high-precision-timestamp system contract (µs since epoch).
     address internal constant HP_TIMESTAMP =
         0x6342000000000000000000000000000000000002;
-
-    /// @dev Denominator for the annual funder rate: interest =
-    /// principal × ratePpm/1e6 × elapsed/365d.
-    uint256 internal constant YEAR = 365 days;
 
     bytes32 internal constant ORDER_TYPEHASH =
         keccak256(
@@ -99,63 +95,34 @@ abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
     mapping(uint256 => uint256) internal openInterestLong;
     mapping(uint256 => uint256) internal openInterestShort;
 
-    // ---- treasury (index lending; see TREASURY_DESIGN.md) ----
+    // ---- treasury: permissionless share vault (see TREASURY_DESIGN.md) ----
 
-    /// @notice Per-market lending pool (see TREASURY_DESIGN.md). Packed to 3 slots.
-    /// `poolAssets` holds lender principal + retained trading P&L; lenders earn a fixed
-    /// rate accrued through the continuous `fundingIndex`. `lenderObligation =
-    /// totalPrincipal + accInterest + frozenOwed`; the creator withdraws `poolAssets −
-    /// obligation` as surplus.
-    struct MarketTreasury {
+    /// @notice One share vault per market. `poolAssets` is the USDM backing the shares
+    /// (all trading P&L flows through it after the oracle rake); a share is worth
+    /// `poolAssets / totalShares`. `rakeOwed` is the feed operator's accrued cut,
+    /// claimable via `claimRake`; `rakePpm` is that cut, cached from the primary feed at
+    /// createMarket. Shares are internal, non-transferable balances.
+    struct Vault {
         // Slot 0
-        uint128 poolAssets;      // lender principal + retained P&L
-        uint128 totalPrincipal;  // Σ principal of active (auto-rolling) deposits
+        uint128 poolAssets;   // USDM backing the shares (post-rake)
+        uint128 rakeOwed;     // feed operator's accrued rake, claimable
         // Slot 1
-        uint128 accInterest;     // Σ accrued interest of active deposits
-        uint128 frozenOwed;      // Σ (principal + term-end interest) of opted-out deposits
+        uint256 totalShares;
         // Slot 2
-        uint128 fundingIndex;    // continuous cumulative-rate accumulator, WAD (1e18 = +100%)
-        uint64  lastAccruedAt;   // last _accrue timestamp
-        uint32  ratePpmAnnual;   // current-term rate (annual PPM); 0 = deposits closed
-        uint32  nextRatePpm;     // scheduled rate; == ratePpmAnnual when none pending
+        uint32  rakePpm;      // cached from the primary feed at createMarket
     }
-    mapping(uint256 => MarketTreasury) internal _treasury;
-    /// @notice Optional hot/cold split, per CREATOR (covers all its markets); while unset
-    /// the creator is its own treasurer.
-    mapping(address => address) internal _treasurer;
+    mapping(uint256 => Vault) internal _vault;
+    /// @notice shares[marketId][user] — internal, non-transferable.
+    mapping(uint256 => mapping(address => uint256)) internal _shares;
 
-    /// @notice One lender deposit. Packed to 3 slots; deleted on withdrawal.
-    struct Deposit {
-        // Slot 0
-        address funder;      // 20
-        uint64  marketId;    // 8
-        bool    optedOut;    // 1 — disambiguates frozenIndex == 0 in a zero-rate market
-        // Slot 1
-        uint128 principal;
-        uint128 entryIndex;  // fundingIndex at deposit
-        // Slot 2
-        uint128 frozenIndex; // term-end index captured at opt-out; 0 while auto-rolling
+    /// @notice A pending unstake: `shares` frozen out at `unlockAt`. Those shares STAY in
+    /// the pool and keep earning + bearing P&L until `withdraw` burns them (the cooldown is
+    /// pure exit friction, not a dodge). One pending request per (market, user).
+    struct Unstake {
+        uint256 shares;
+        uint64  unlockAt;
     }
-    mapping(uint256 => Deposit) internal _deposits;
-    uint256 internal _nextDepositId;
-
-    // ---- modifiers / role helpers ----
-
-    /// @dev The key currently authorized to run `creator`'s treasury.
-    function _effectiveTreasurer(address creator) internal view returns (address) {
-        address t = _treasurer[creator];
-        return t == address(0) ? creator : t;
-    }
-    modifier onlyTreasurer(address creator) {
-        if (msg.sender != _effectiveTreasurer(creator)) revert NotTreasurer();
-        _;
-    }
-    modifier onlyMarketTreasurer(uint256 marketId) {
-        address creator = _creatorOf[marketId];
-        if (creator == address(0)) revert UnknownMarket();
-        if (msg.sender != _effectiveTreasurer(creator)) revert NotTreasurer();
-        _;
-    }
+    mapping(uint256 => mapping(address => Unstake)) internal _unstake;
 
     constructor(address usdm_, address oracle_) {
         if (usdm_ == address(0) || oracle_ == address(0)) revert ZeroAddress();
