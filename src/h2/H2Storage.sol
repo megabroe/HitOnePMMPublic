@@ -83,6 +83,10 @@ abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
         // Slot 5
         uint128 notionalAtOpen; // USDM-wei
         uint128 makerCutPaid;   // winnings cut (name kept for continuity)
+        // Slot 6
+        uint64  lastActionBlock; // block.number of the last user mutation (open/increase/
+                                 // decrease); one adjustment per block, so a convex size-fee
+                                 // curve can't be dodged by chunking within one block
     }
     mapping(uint256 => Position) internal _positions;
     uint256 public override nextPositionId;

@@ -63,6 +63,10 @@ abstract contract H2Markets is H2Storage {
         if (feed.priceTick != r.priceTick) revert BadMarketParams();
         if (o.fallbackFeed == address(0)) revert BadMarketParams();
         if (o.fallbackDecimals > 18) revert BadMarketParams();
+        // Decimals scale the fallback price to 1e18; a caller-supplied value that disagrees with
+        // the aggregator would misprice every fallback fill and skew the deviation gate, so pin
+        // it to the feed's own `decimals()` rather than trust the argument.
+        if (IAggregatorV3(o.fallbackFeed).decimals() != o.fallbackDecimals) revert BadMarketParams();
         if (o.primaryStaleSecs == 0 || o.primaryStaleSecs > 1 days) revert BadMarketParams();
         if (o.fallbackMaxAge == 0 || o.fallbackMaxAge > 1 hours) revert BadMarketParams();
         if (o.fbOpenSpreadPpm > 200_000 || o.fbCloseSpreadPpm > 200_000) revert BadMarketParams();
@@ -140,11 +144,11 @@ abstract contract H2Markets is H2Storage {
     /// @dev One side's funding index projected to now, computed locally from a FeedView
     /// (saves a second oracle call on paths that already fetched the feed).
     function _indexNow(IH2Oracle.FeedView memory feed, bool isLong) internal view returns (int128) {
-        return FundingIndex.effectiveAtPct(
+        return FundingIndex.effectiveAtPctMs(
             isLong ? feed.fundingIndexLong : feed.fundingIndexShort,
             isLong ? feed.rateLong : feed.rateShort,
             feed.mark,
-            feed.lastPushAt, uint64(block.timestamp)
+            feed.lastPushMs, uint64(_microTimestamp() / 1000)
         );
     }
 
@@ -191,7 +195,7 @@ abstract contract H2Markets is H2Storage {
     function _primaryStale(uint256 marketId, IH2Oracle.FeedView memory feed)
         internal view returns (bool)
     {
-        if (feed.lastPushAt == 0) return false;
+        if (feed.lastPushMs == 0) return false;
         uint64 nowMs = uint64(_microTimestamp() / 1000);
         return nowMs - feed.lastPushMs > uint64(_oracles[marketId].primaryStaleSecs) * 1000;
     }

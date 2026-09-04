@@ -43,7 +43,7 @@ abstract contract H2Fallback is H2Positions {
         if (r.staleSpreadK == 0) revert SelfServiceDisabled();
 
         IH2Oracle.FeedView memory feed = _feed(marketId);
-        if (feed.lastPushAt == 0) revert PrimaryNeverPushed();
+        if (feed.lastPushMs == 0) revert PrimaryNeverPushed();
 
         // Mark age must be under the sentinel gap: a mark older than that sits across a ring
         // discontinuity the walk-back cannot replay, so it is not a safe anchor for a new

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.27;
 
-import { Test } from "forge-std/Test.sol";
+import { Test, Vm } from "forge-std/Test.sol";
 
 import { H2Market }  from "../../src/h2/H2Market.sol";
 import { H2Oracle }  from "../../src/h2/H2Oracle.sol";
@@ -41,7 +41,10 @@ contract H2MarketTest is Test {
     );
 
     uint256 internal _t;
-    function _adv(uint256 dt) internal { _t += dt; vm.warp(_t); }
+    // Advancing time also advances the block number: a position may be adjusted at most once per
+    // block (SameBlockAction), so consecutive open/adjust/close steps must land in distinct blocks
+    // — which is what happens on-chain as wall-clock time passes.
+    function _adv(uint256 dt) internal { _t += dt; vm.warp(_t); vm.roll(block.number + 1); }
 
     /// @dev Back a market's share vault with `amount` of USDM from carl (the sole LP).
     function _seedTreasury(uint256 marketId, uint256 amount) internal {
@@ -756,5 +759,123 @@ contract H2MarketTest is Test {
     function test_grossOpenNotionalIsPerMarket() public {
         _openLong(alicePk, 1e18, 100, 50_000e18, 0);
         assertEq(h.grossOpenNotional(mkt), 50_000e18);
+    }
+
+    // ============================================================
+    // audit fixes
+    // ============================================================
+
+    /// FIX 1: increasing a WINNING position crystallizes the winnings cut at the PRE-increase
+    /// collateral, so padding size/collateral can't dilute the cut a later close would pay. The
+    /// crystallized cut equals what a direct full close of the same gain would take — no dodge.
+    function test_increaseCrystallizesWinningsCutAtOriginalBasis() public {
+        // Path 1 (alice): open 1u @ 50k (100x), close fully at 55k → the cut on the full gain.
+        uint256 idA = _openLong(alicePk, 1e18, 100, 50_000e18, 0);
+        _adv(1);
+        IH2Market.Order memory cA = _order(alicePk, true, false, 1e18, 0, 54_500e18, 200, 1);
+        _pushOrder(55_000e18, cA, _sign(alicePk, cA), 0);
+        uint256 cutDirect = h.positions(idA).makerCutPaid;
+        assertGt(cutDirect, 0, "a big winner pays a cut on a direct close");
+
+        // Path 2 (bob): identical open, then INCREASE at 55k instead of closing.
+        uint256 idB = _openLong(bobPk, 1e18, 100, 50_000e18, 0);
+        IH2Market.VaultView memory vBefore = h.vaultOf(mkt);
+        _adv(1);
+        IH2Market.Order memory incB = _order(bobPk, true, true, 1e18, 100, 55_500e18, 200, 1);
+        _pushOrder(55_000e18, incB, _sign(bobPk, incB), 0);
+
+        // The cut was taken NOW, at the original collateral — same magnitude as the direct close.
+        uint256 cutCrystallized = h.positions(idB).makerCutPaid;
+        assertApproxEqRel(cutCrystallized, cutDirect, 1e15, "increase pays the same cut as a direct close");
+        assertGt(h.vaultOf(mkt).rakeOwed, vBefore.rakeOwed, "the cut was credited (rake grew)");
+        assertEq(h.positions(idB).entryPrice, 55_000e18, "basis rebased to the fill");
+    }
+
+    /// FIX 1 (event): PositionIncreased surfaces the crystallized winnings cut so an indexer can
+    /// read it directly; the field is 0 when nothing was crystallized (flat/loss increase).
+    function test_positionIncreasedEmitsCrystallizedCut() public {
+        // A winning increase: the event's makerCut equals the cut actually crystallized.
+        uint256 idB = _openLong(bobPk, 1e18, 100, 50_000e18, 0);
+        _adv(1);
+        IH2Market.Order memory inc = _order(bobPk, true, true, 1e18, 100, 55_500e18, 200, 1);
+        vm.recordLogs();
+        _pushOrder(55_000e18, inc, _sign(bobPk, inc), 0);
+        uint256 emitted = _increasedMakerCut(vm.getRecordedLogs());
+        assertGt(emitted, 0, "winning increase emits a nonzero cut");
+        assertEq(emitted, h.positions(idB).makerCutPaid, "event cut == crystallized cut");
+
+        // A losing increase crystallizes nothing: the event's makerCut is 0.
+        _openLong(alicePk, 1e18, 100, 50_000e18, 0);
+        _adv(1);
+        IH2Market.Order memory inc2 = _order(alicePk, true, true, 1e18, 100, 49_900e18, 200, 1);
+        vm.recordLogs();
+        _pushOrder(49_800e18, inc2, _sign(alicePk, inc2), 0);
+        assertEq(_increasedMakerCut(vm.getRecordedLogs()), 0, "loss increase emits zero cut");
+    }
+
+    /// Pull the `makerCut` field out of the first PositionIncreased log. Data (non-indexed) is
+    /// (addSize, fillPrice, newSize, newEntryPrice, addCollateral, openFee, makerCut, checkpoint).
+    function _increasedMakerCut(Vm.Log[] memory logs) internal pure returns (uint256) {
+        bytes32 sig = keccak256(
+            "PositionIncreased(uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,int128)"
+        );
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == sig) {
+                (, , , , , , uint256 makerCut, ) = abi.decode(
+                    logs[i].data,
+                    (uint256, uint256, uint256, uint256, uint256, uint256, uint256, int128)
+                );
+                return makerCut;
+            }
+        }
+        revert("no PositionIncreased log");
+    }
+
+    /// FIX 1 (negative): increasing a LOSING position is not crystallized — the size-weighted
+    /// blend preserves the unrealized loss, and no cut is taken (nothing to tax).
+    function test_increaseDoesNotCrystallizeALoss() public {
+        uint256 id = _openLong(alicePk, 1e18, 100, 50_000e18, 0);
+        assertEq(h.positions(id).makerCutPaid, 0);
+        _adv(1);
+        IH2Market.Order memory inc = _order(alicePk, true, true, 1e18, 100, 49_900e18, 200, 1);
+        _pushOrder(49_800e18, inc, _sign(alicePk, inc), 0); // dip: solvent at 100x, not liquidatable
+        assertEq(h.positions(id).makerCutPaid, 0, "a loss is not crystallized");
+        uint256 e = h.positions(id).entryPrice;
+        assertGt(e, 49_800e18, "entry blended, not rebased to the fill");
+        assertLt(e, 50_000e18);
+        // OI unwinds cleanly on full close afterwards.
+        _adv(1);
+        IH2Market.Order memory c = _order(alicePk, true, false, 2e18, 0, 49_000e18, 500, 2);
+        _pushOrder(49_800e18, c, _sign(alicePk, c), 0);
+        assertTrue(h.positions(id).closed);
+        assertEq(h.grossOpenNotional(mkt), 0, "OI back to zero");
+    }
+
+    /// FIX 2: a position may be adjusted at most once per block — a same-block second adjustment
+    /// reverts SameBlockAction (so the convex size-fee curve can't be dodged by chunking within a
+    /// block); the identical action succeeds a block later.
+    function test_sameBlockAdjustmentReverts() public {
+        uint256 id = _openLong(alicePk, 1e18, 100, 50_000e18, 0); // opened this block; mark+fallback fresh
+        IH2Market.Order memory inc = _order(alicePk, true, true, 1e18, 100, 50_200e18, 200, 1);
+        vm.prank(keeper);
+        vm.expectRevert(IH2Market.SameBlockAction.selector);
+        h.executeAtMark(inc, _sign(alicePk, inc));
+
+        _adv(1); // next block, time passes
+        _refresh(50_000e18);
+        vm.prank(keeper);
+        uint256 id2 = h.executeAtMark(inc, _sign(alicePk, inc));
+        assertEq(id2, id);
+        assertEq(h.positions(id).size, 2e18, "the increase lands a block later");
+    }
+
+    /// FIX 3: the market must not trust a caller-supplied fallback-decimals that disagrees with
+    /// the aggregator's own `decimals()`.
+    function test_createMarketRejectsMismatchedFallbackDecimals() public {
+        IH2Market.OracleParams memory o = _oracleParams(); // fallback aggregator is 8 decimals
+        o.fallbackDecimals = 6;
+        vm.prank(op);
+        vm.expectRevert(IH2Market.BadMarketParams.selector);
+        h.createMarket(token, _fees(), _risk(0), o);
     }
 }

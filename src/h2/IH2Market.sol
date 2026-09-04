@@ -197,6 +197,7 @@ interface IH2Market {
         uint256 newEntryPrice,
         uint256 addCollateral,
         uint256 openFee,
+        uint256 makerCut,   // winnings cut crystallized on this increase (0 if flat/loss)
         int128  newFundingCheckpoint
     );
     event PositionClosed(
@@ -259,6 +260,8 @@ interface IH2Market {
     error PositionLiquidatable();  // increase refused while a liquidation is recorded
     error NoneLiquidated();
     error Insolvent();
+    error SameBlockAction();       // a position may be adjusted at most once per block (anti
+                                   // size-fee chunking); wait a block to increase/decrease/close
 
     error OrderExpired();
     error NonceAlreadyUsed();

@@ -18,6 +18,13 @@ library FundingIndex {
     /// This both hard-caps the rate at 1%/sec and uses the whole int64 for the useful range.
     int256 internal constant PCT_SCALE = int256(100) << 63;
 
+    /// @dev Milliseconds per second. The `*Ms` variants below integrate the per-SECOND rate
+    /// over a dt expressed in ms, so they divide by an extra factor of this. For a whole-second
+    /// span they return exactly what the per-second variants do — `(A·1000)/(D·1000) == A/D` in
+    /// integer arithmetic — so switching a caller from seconds to ms is regression-neutral while
+    /// gaining sub-second resolution (H2 pushes marks sub-second; whole-second accrual dropped it).
+    int256 internal constant MS_PER_SEC = 1000;
+
     /// @notice Extrapolate the committed `fundingIndex` forward to `targetTime` at `rate`.
     /// `fundingIndex` is the value committed at `lastPushAt`. Caller ensures targetTime ≥ lastPushAt.
     function effectiveAt(int128 fundingIndex, int64 rate, uint64 lastPushAt, uint64 targetTime)
@@ -66,6 +73,30 @@ library FundingIndex {
         internal pure returns (int128)
     {
         int256 delta = (int256(ratePct) * int256(mark1e18) * int256(uint256(durationSec))) / PCT_SCALE;
+        int256 out   = int256(indexAtK) - delta;
+        require(out >= type(int128).min && out <= type(int128).max, "FI: overflow");
+        return int128(out);
+    }
+
+    /// @notice Millisecond variant of {effectiveAtPct}: the per-second `ratePct` integrated over
+    /// `[lastPushMs, targetMs]` in MILLISECONDS. Used by venues whose publication cadence is
+    /// sub-second (H2), where a whole-second clock would floor most intervals to zero accrual.
+    /// `mark1e18` is the mark held over the interval. Caller ensures targetMs ≥ lastPushMs.
+    function effectiveAtPctMs(int128 fundingIndex, int64 ratePct, uint256 mark1e18, uint64 lastPushMs, uint64 targetMs)
+        internal pure returns (int128)
+    {
+        uint64 dtMs  = targetMs - lastPushMs;
+        int256 delta = (int256(ratePct) * int256(mark1e18) * int256(uint256(dtMs))) / (PCT_SCALE * MS_PER_SEC);
+        int256 out   = int256(fundingIndex) + delta;
+        require(out >= type(int128).min && out <= type(int128).max, "FI: overflow");
+        return int128(out);
+    }
+
+    /// @notice Millisecond variant of {stepBackPct}: `durationMs` is the segment length in ms.
+    function stepBackPctMs(int128 indexAtK, int64 ratePct, uint256 mark1e18, uint64 durationMs)
+        internal pure returns (int128)
+    {
+        int256 delta = (int256(ratePct) * int256(mark1e18) * int256(uint256(durationMs))) / (PCT_SCALE * MS_PER_SEC);
         int256 out   = int256(indexAtK) - delta;
         require(out >= type(int128).min && out <= type(int128).max, "FI: overflow");
         return int128(out);

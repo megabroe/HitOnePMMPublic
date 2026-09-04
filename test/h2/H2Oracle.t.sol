@@ -183,4 +183,45 @@ contract H2OracleTest is Test {
         vm.expectRevert(IH2Oracle.RefStale.selector);
         oracle.push(id, 50_000e18);
     }
+
+    // ============================================================
+    // audit fixes
+    // ============================================================
+
+    function _mockHp(uint256 micros) internal {
+        vm.mockCall(
+            0x6342000000000000000000000000000000000002,
+            abi.encodeWithSignature("timestamp()"),
+            abi.encode(micros)
+        );
+    }
+
+    /// FIX 3: reference decimals must match the aggregator's own `decimals()`, not a
+    /// caller-supplied value (the mock is 8 decimals).
+    function test_createFeedRejectsMismatchedRefDecimals() public {
+        vm.prank(op);
+        vm.expectRevert(IH2Oracle.BadFeedParams.selector);
+        oracle.createFeed(op, 1e18, RATE_CAP, RAKE_PPM, address(ref), 6, 100_000, 1 hours);
+    }
+
+    /// FIX 4: funding integrates on the millisecond clock, so a sub-second interval accrues
+    /// (a whole-second clock floored it to zero) and accrual is linear in ms.
+    function test_fundingAccruesSubSecondOnMsClock() public {
+        uint256 id = _bandedFeed();
+        uint256 base = uint256(_t) * 1_000_000; // µs, aligned to block.timestamp
+        _mockHp(base);
+        IH2Oracle.Call[] memory none = new IH2Oracle.Call[](0);
+        vm.prank(op);
+        oracle.pushWithParams(id, 50_000e18, int64(uint64(RATE_CAP)), 0, 0, none); // long rate, index=0
+
+        // Project forward on the HP (ms) clock without advancing block.timestamp at all.
+        _mockHp(base + 500_000);   // +500 ms
+        int128 idx500 = oracle.indexNow(id, true);
+        _mockHp(base + 1_000_000); // +1000 ms
+        int128 idx1000 = oracle.indexNow(id, true);
+
+        assertGt(idx500, 0, "sub-second funding accrues (a whole-second clock would floor to 0)");
+        assertApproxEqAbs(int256(idx1000), int256(idx500) * 2, 2, "linear in ms: 1000ms == 2 x 500ms");
+        assertEq(oracle.indexNow(id, false), int128(0), "short side unaffected");
+    }
 }

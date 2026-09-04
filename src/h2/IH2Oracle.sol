@@ -55,8 +55,8 @@ interface IH2Oracle {
         int64   rateLong;          // signed fixed-point fraction/sec, real = rate/(100·2⁶³)
         int64   rateShort;
         uint32  spreadPpm;         // operator-published vol spread; consumers cap it
-        uint64  lastPushAt;        // seconds — funding clock
-        uint64  lastPushMs;        // HP wall-clock ms — ring/staleness clock
+        uint64  lastPushMs;        // HP wall-clock ms — the single push clock (funding,
+                                   // ring, staleness); 0 iff the feed has never been pushed
         uint64  ringHead;
     }
 

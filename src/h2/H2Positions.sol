@@ -163,7 +163,8 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
             fundingCheckpoint: fundingNow,
             realizedPnl:       0,
             notionalAtOpen:    uint128(notional),
-            makerCutPaid:      0
+            makerCutPaid:      0,
+            lastActionBlock:   uint64(block.number)
         });
         activePositionId[order.user][marketId] = id;
         openInterestLong[marketId]  = newLong;
@@ -186,6 +187,10 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         id = activePositionId[order.user][marketId];
         if (id == 0) revert NoPosition();
         Position storage pos = _positions[id];
+        // One adjustment per block: the size-fee curve is convex, so splitting an increase into
+        // chunks within a single block would dodge its super-linear terms. (Cross-block chunking
+        // still can, but pays a block of price/liquidation risk per slice — the accepted residual.)
+        if (pos.lastActionBlock == uint64(block.number)) revert SameBlockAction();
         if (order.isLong   != pos.isLong)   revert BadUserSig();
         if (order.leverage != pos.leverage) revert BadUserSig();
         // An increase resets openTime/openMs — the walk-back floor — so it must not be
@@ -224,37 +229,69 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
 
         int128 fundingNow = _indexNow(feed, order.isLong);
 
-        // Size-weighted blends preserve the old size's unrealized PnL and accrued funding
-        // exactly, while the added size enters at the fill / current funding.
         uint256 oldSize = uint256(pos.size);
         uint256 newSize = oldSize + uint256(addSizeUnits);
-        if (newSize >= UNITS_CAP) revert BadSize();
-        uint256 newEntry = (uint256(pos.entryPrice) * oldSize + uint256(fillUnits) * uint256(addSizeUnits)) / newSize;
-        int256  newCheckpoint =
-            (int256(pos.fundingCheckpoint) * int256(oldSize) + int256(fundingNow) * int256(uint256(addSizeUnits)))
-            / int256(newSize);
-
-        uint256 newCol = uint256(pos.col) + addColAfterFee;
-        if (newCol > type(uint128).max)        revert BadSize();
+        if (newSize >= UNITS_CAP)              revert BadSize();
         if (totalNotional > type(uint128).max) revert BadSize();
+
+        // CRYSTALLIZE THE WINNINGS CUT ON INCREASE.
+        // The cut ramps on percent return (effPnl/col). Blending fresh size + collateral into a
+        // winning position would dilute that return, so a later close would pay a smaller cut than
+        // the position actually earned — a cost-basis reset dodge. Close it by settling the
+        // EXISTING position's unrealized gain at the fill HERE, taking the cut at the PRE-increase
+        // collateral (its true, undiluted return), and rolling the net gain into collateral. Both
+        // the realized old size and the fresh size then enter at the fill, so the basis collapses
+        // to `fillUnits`. A loss/flat position is NOT crystallized (nothing to tax): the
+        // size-weighted blend preserves its unrealized PnL exactly, as before.
+        // The realization price is the increase's own adverse fill (for a long, ≥ mark) —
+        // marginally in the user's favor, and consistent with where the new size enters.
+        (int256 pnl0, int256 funding0, , uint256 cut0) =
+            _settleSlice(pos, pos.size, uint256(pos.col), fillUnits, fundingNow, r, f);
+        int256 effPnl0 = pnl0 - funding0;
+
+        uint256 newCol;
+        uint256 newEntry;
+        int256  newCheckpoint;
+        if (effPnl0 > 0) {
+            _drainPool(marketId, uint256(effPnl0));
+            if (cut0 > 0) _credit(marketId, cut0);
+            newCol        = uint256(pos.col) + addColAfterFee + (uint256(effPnl0) - cut0);
+            newEntry      = uint256(fillUnits);
+            newCheckpoint = int256(fundingNow);
+            pos.makerCutPaid += uint128(cut0);
+        } else {
+            // Size-weighted blends preserve the old size's unrealized PnL and accrued funding
+            // exactly, while the added size enters at the fill / current funding.
+            newCol        = uint256(pos.col) + addColAfterFee;
+            newEntry      = (uint256(pos.entryPrice) * oldSize + uint256(fillUnits) * uint256(addSizeUnits)) / newSize;
+            newCheckpoint =
+                (int256(pos.fundingCheckpoint) * int256(oldSize) + int256(fundingNow) * int256(uint256(addSizeUnits)))
+                / int256(newSize);
+        }
+        if (newCol > type(uint128).max) revert BadSize();
 
         pos.entryPrice        = uint128(newEntry);
         pos.size              = uint128(newSize);
         pos.col               = uint128(newCol);
         pos.fundingCheckpoint = int128(newCheckpoint);
+        // OI-consistent sum (open + this add); NOT rebased to the fill, so `_decreaseOI` on close
+        // unwinds exactly what open/increase added.
         pos.notionalAtOpen    = uint128(totalNotional);
-        // The blended entry only becomes valid now; the walk-back floor moves with it.
+        // The (rebased or blended) entry only becomes valid now; the walk-back floor moves with it.
         pos.openTime          = uint64(block.timestamp);
         pos.openMs            = uint64(_microTimestamp() / 1000);
+        pos.lastActionBlock   = uint64(block.number);
 
         openInterestLong[marketId]  = newLong;
         openInterestShort[marketId] = newShort;
 
+        // Read the just-written pos fields (identical to the newSize/newEntry/newCheckpoint
+        // locals) so those locals can die before the emit — keeps the stack in bounds.
         emit PositionIncreased(
             id, marketId, order.size, fill1e18,
-            _sizeOut(uint128(newSize), r.sizeTick),
-            _priceOut(uint128(newEntry), r.priceTick),
-            addColAfterFee, fee, int128(newCheckpoint)
+            _sizeOut(pos.size, r.sizeTick),
+            _priceOut(pos.entryPrice, r.priceTick),
+            addColAfterFee, fee, cut0, pos.fundingCheckpoint
         );
     }
 
@@ -269,6 +306,9 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         uint256 id = activePositionId[order.user][marketId];
         if (id == 0) revert NoPosition();
         Position storage pos = _positions[id];
+        // One adjustment per block (see _increasePosition): a partial close is an adjustment too,
+        // so chunking a close within a block cannot dodge the convex close-fee curve.
+        if (pos.lastActionBlock == uint64(block.number)) revert SameBlockAction();
         // The signed side must match: the adverse-fill direction derives from it.
         if (order.isLong != pos.isLong) revert BadUserSig();
         uint128 closeSizeUnits = _toSizeUnits(order.size, r.sizeTick);
@@ -305,7 +345,7 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         IH2Oracle.FeedView memory feed = _feed(marketId);
         // Never settle at an uninitialized mark; and under dual oracle failure this stale
         // mark IS the documented exit.
-        if (feed.lastPushAt == 0) revert PrimaryNeverPushed();
+        if (feed.lastPushMs == 0) revert PrimaryNeverPushed();
         uint128 markUnits = uint128(feed.mark / _risk[marketId].priceTick);
         // Expiry is a forced event: no close fee.
         uint256 payout_ = _settleClose(id, markUnits, feed, false);
@@ -376,6 +416,7 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         pos.size           = pos.size - closeSizeUnits;
         pos.col            = uint128(uint256(pos.col) - colPortion);
         pos.notionalAtOpen = uint128(uint256(pos.notionalAtOpen) - notionalPortion);
+        pos.lastActionBlock = uint64(block.number); // one adjustment per block
 
         address user = pos.user;
         emit PositionDecreased(
@@ -511,7 +552,7 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
     {
         Position storage pos = _positions[id];
         if (pos.user == address(0) || pos.closed) return (false, 0, 0);
-        if (feed.lastPushAt == 0) return (false, 0, 0);
+        if (feed.lastPushMs == 0) return (false, 0, 0);
         if (feed.lastPushMs < pos.openMs) return (false, 0, 0);
         RiskParams storage r = _risk[marketId];
 
@@ -540,7 +581,7 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
             uint64 stepMs = uint64(timeDeltaMs * MarkRing.GAP_UNIT_MS);
             // msAtK now names the timestamp of the mark we step back TO.
             msAtK   -= stepMs;
-            indexAtK = FundingIndex.stepBackPct(indexAtK, rateSide, uint256(markAtK) * r.priceTick, stepMs / 1000);
+            indexAtK = FundingIndex.stepBackPctMs(indexAtK, rateSide, uint256(markAtK) * r.priceTick, stepMs);
             int256 prev = int256(uint256(markAtK)) - priceDelta;
             if (prev <= 0) return (false, 0, 0);
             markAtK = uint128(uint256(prev));

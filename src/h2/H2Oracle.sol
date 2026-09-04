@@ -27,7 +27,6 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
     struct Feed {
         // Slot 0
         address operator;   // 20
-        uint64  lastPushAt; // 8 — seconds, funding clock
         uint32  spreadPpm;  // 4
         // Slot 1
         uint128 priceTick;   // 1e18-scale quantum
@@ -84,6 +83,10 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
             if (refBandPpm == 0 || refBandPpm > PPM) revert BadFeedParams();
             if (refMaxStale == 0) revert BadFeedParams();
             if (refDecimals > 18) revert BadFeedParams();
+            // Decimals scale the reference price in the band check; a caller-supplied value
+            // that disagrees with the aggregator would misscale every comparison, so pin it to
+            // the feed's own `decimals()` rather than trust the argument.
+            if (IAggregatorV3(refFeed).decimals() != refDecimals) revert BadFeedParams();
         } else {
             if (refBandPpm != 0 || refMaxStale != 0 || refDecimals != 0) revert BadFeedParams();
         }
@@ -160,9 +163,8 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
         uint64 nowMs = uint64(microTs / 1000);
         bool rateChanged = rateLong != f.rateLong || rateShort != f.rateShort;
 
-        if (f.lastPushAt == 0) {
+        if (f.lastPushMs == 0) {
             f.currentMark = uint128(units);
-            f.lastPushAt  = uint64(block.timestamp);
             f.lastPushMs  = nowMs;
             f.rateLong    = rateLong;
             f.rateShort   = rateShort;
@@ -176,10 +178,11 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
         if (elapsedMs == 0) revert MarkSameSlot();
 
         // Accrue the elapsed interval on BOTH sides at the OLD rates and OLD mark (a step
-        // function held until this publication overwrites it).
+        // function held until this publication overwrites it). Integrated on the ms clock:
+        // marks arrive sub-second, so a whole-second clock floored most intervals to no accrual.
         uint256 oldMark1e18 = uint256(f.currentMark) * tick;
-        f.fundingIndexLong  = FundingIndex.effectiveAtPct(f.fundingIndexLong,  f.rateLong,  oldMark1e18, f.lastPushAt, uint64(block.timestamp));
-        f.fundingIndexShort = FundingIndex.effectiveAtPct(f.fundingIndexShort, f.rateShort, oldMark1e18, f.lastPushAt, uint64(block.timestamp));
+        f.fundingIndexLong  = FundingIndex.effectiveAtPctMs(f.fundingIndexLong,  f.rateLong,  oldMark1e18, f.lastPushMs, nowMs);
+        f.fundingIndexShort = FundingIndex.effectiveAtPctMs(f.fundingIndexShort, f.rateShort, oldMark1e18, f.lastPushMs, nowMs);
 
         int256 priceDelta;
         unchecked {
@@ -201,7 +204,6 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
 
         f.ringHead    = head + 1;
         f.currentMark = uint128(units);
-        f.lastPushAt  = uint64(block.timestamp);
         f.lastPushMs  = nowMs;
         f.spreadPpm   = spreadPpm;
         if (rateChanged) {
@@ -252,7 +254,6 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
             rateLong:          f.rateLong,
             rateShort:         f.rateShort,
             spreadPpm:         f.spreadPpm,
-            lastPushAt:        f.lastPushAt,
             lastPushMs:        f.lastPushMs,
             ringHead:          f.ringHead
         });
@@ -261,11 +262,11 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
     function indexNow(uint256 feedId, bool isLong) external view override returns (int128) {
         Feed storage f = _feeds[feedId];
         if (f.operator == address(0)) revert UnknownFeed();
-        return FundingIndex.effectiveAtPct(
+        return FundingIndex.effectiveAtPctMs(
             isLong ? f.fundingIndexLong : f.fundingIndexShort,
             isLong ? f.rateLong : f.rateShort,
             uint256(f.currentMark) * uint256(f.priceTick),
-            f.lastPushAt, uint64(block.timestamp)
+            f.lastPushMs, uint64(_microTimestamp() / 1000)
         );
     }
 
