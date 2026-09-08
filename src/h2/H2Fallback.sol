@@ -57,9 +57,9 @@ abstract contract H2Fallback is H2Positions {
         // anchor is fatal here, unlike the operator-attached path.
         _assertConvergence(marketId, feed.mark, true);
 
-        // staleSpread = staleSpreadK · √ageMs (ppm), on TOP of the feed's capped spread.
-        uint256 spreadPpm = feed.spreadPpm;
-        if (spreadPpm > r.maxSpreadPpm) spreadPpm = r.maxSpreadPpm;
+        // staleSpread = staleSpreadK · √ageMs (ppm), on TOP of the market's DERIVED spread
+        // (from the feed's vol/skew).
+        uint256 spreadPpm = _derivedSpread(marketId, feed, order.isOpen, order.isLong);
         spreadPpm += uint256(r.staleSpreadK) * Math.sqrt(ageMs);
 
         uint256 fill = _adverseFill(order, feed.mark, spreadPpm, r.priceTick);

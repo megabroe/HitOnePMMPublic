@@ -11,5 +11,8 @@ import { H2Fallback } from "./H2Fallback.sol";
 /// settlement token and the H2Oracle it consumes. Everything else (markets, treasuries,
 /// feeds) is created permissionlessly. See IH2Market and ORACLE_DESIGN.md.
 contract H2Market is H2Fallback {
-    constructor(address usdm_, address oracle_) H2Storage(usdm_, oracle_) EIP712("H2Market", "1") {}
+    constructor(address usdm_, address oracle_)
+        H2Storage(usdm_, oracle_)
+        EIP712("H2Market", "1")
+    {}
 }

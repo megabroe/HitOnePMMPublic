@@ -103,6 +103,21 @@ abstract contract H2Treasury is H2Storage {
     }
 
     // ============================================================
+    // builder codes (eligibility gated by the per-market registry; see H2Markets._builderEligible)
+    // ============================================================
+
+    /// @notice Claim the caller's accrued builder fees (USDM) to `to`. Fees accrue in the market
+    /// as orders are filled; the external registry only gated who was eligible to accrue them.
+    function claimBuilderFees(address to) external override nonReentrant {
+        if (to == address(0)) revert ZeroAddress();
+        uint256 amount = builderOwed[msg.sender];
+        if (amount == 0) revert ZeroAmount();
+        builderOwed[msg.sender] = 0;
+        emit BuilderFeesClaimed(msg.sender, to, amount);
+        usdm.safeTransfer(to, amount);
+    }
+
+    // ============================================================
     // views
     // ============================================================
 
@@ -144,6 +159,31 @@ abstract contract H2Treasury is H2Storage {
         uint256 rake = amount * v.rakePpm / PPM;
         v.rakeOwed   += uint128(rake);
         v.poolAssets += uint128(amount - rake);
+    }
+
+    /// @dev `_credit` for an ORDER-DRIVEN fee/cut, splitting the builder's share out of the
+    /// VAULT RESIDUAL: the oracle rake is skimmed FIRST (senior, untouched by the builder), then
+    /// an ELIGIBLE builder takes `builderFeePpm` of what remains, and only the rest lifts share
+    /// price. Eligibility is the per-market registry's call (`_builderEligible`); an ineligible/
+    /// zero builder simply forfeits the share to the vault. Used for open fees, close fees, and
+    /// the winnings cut (open crystallization + close/decrease).
+    function _creditWithBuilder(
+        uint256 marketId, uint256 amount, address builder, uint256 builderFeePpm,
+        uint256 positionId, bool isOpenSide
+    ) internal {
+        Vault storage v = _vault[marketId];
+        uint256 rake = amount * v.rakePpm / PPM;
+        v.rakeOwed += uint128(rake);
+        uint256 net = amount - rake;
+        if (builderFeePpm != 0 && _builderEligible(marketId, builder)) {
+            uint256 bCut = net * builderFeePpm / PPM;
+            if (bCut > 0) {
+                builderOwed[builder] += bCut;
+                net -= bCut;
+                emit BuilderFeeAccrued(marketId, builder, positionId, isOpenSide, bCut);
+            }
+        }
+        v.poolAssets += uint128(net);
     }
 
     /// @dev A user win leaves the pool. Reverts `Insolvent` when the pool cannot cover it

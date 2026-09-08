@@ -158,6 +158,38 @@ library ParamCatalog {
         if (quadScale   != 0) ppm += quadScale * n * n / SIZE_FEE_QUAD_REF;
     }
 
+    /// @notice Vol/skew → spread. The feed operator publishes a `(vol, skew)` estimate, both
+    /// in PPM of price (`10_000` = 1%); the market's frozen `(volK, skewK)` coefficients derive
+    /// the per-side spread, capped:
+    ///   spread = volK·vol²/VOL_REF ± skewK·skew/SKEW_REF   (clamped to [0, maxSpreadPpm])
+    /// The `vol²` term prices variance (a doubling of vol quadruples the spread, below the cap);
+    /// the linear skew term is added on the taker's BUY side and subtracted on the SELL side —
+    /// the caller passes `up = (isLong == isOpen)` (true when the taker is buying: opening a long
+    /// or closing a short), so `skew > 0` charges buyers more and rebates sellers (standard
+    /// inventory/drift quote-skew, applied by fill direction, not by position side). `VOL_REF`
+    /// pins `volK` as "ppm of spread at 1% vol" (vol=10_000 ⇒ base=volK); `SKEW_REF` pins `skewK`
+    /// as "ppm per 1% skew". The favored side floors at 0 (never a rebate). Never reverts: the
+    /// intermediate `volK·vol²` fits uint256 (volK ≤ 1e9, vol ≤ 2³²), and the result caps.
+    uint256 internal constant VOL_REF  = 1e8;   // (1% vol)² in ppm² = 10_000² = 1e8
+    uint256 internal constant SKEW_REF = 1e4;   // 1% skew in ppm
+    function derivedSpread(
+        uint32  vol,
+        int32   skew,
+        uint32  volK,
+        uint32  skewK,
+        bool    up,
+        uint256 maxSpreadPpm
+    ) internal pure returns (uint256) {
+        // base = volK · vol² / VOL_REF  (variance-like, unsigned)
+        uint256 base = uint256(volK) * uint256(vol) * uint256(vol) / VOL_REF;
+        // skewTerm = skewK · skew / SKEW_REF  (signed, linear). skew>0 disfavors buyers (up-fills).
+        int256 skewTerm = (int256(uint256(skewK)) * int256(skew)) / int256(SKEW_REF);
+        int256 sided = int256(base) + (up ? skewTerm : -skewTerm);
+        if (sided <= 0) return 0; // clamp ≥ 0: the favored side never gets a rebate
+        uint256 s = uint256(sided);
+        return s > maxSpreadPpm ? maxSpreadPpm : s;
+    }
+
     /// @notice Validate `risk`. `linearScale` and `quadScale` are interpreted in sizeUnits.
     function validateRisk(Risk memory p) internal pure {
         if (p.openFeeBps > MAX_FEE_BPS)                                      revert BadFee();

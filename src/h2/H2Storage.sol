@@ -12,6 +12,7 @@ import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 
 import { IH2Market } from "./IH2Market.sol";
 import { IH2Oracle } from "./IH2Oracle.sol";
+import { IBuilderRegistry } from "./IBuilderRegistry.sol";
 import { IHighPrecisionTimestamp } from "../common/IHighPrecisionTimestamp.sol";
 
 /// @title H2Storage
@@ -37,26 +38,47 @@ abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
     bytes32 internal constant ORDER_TYPEHASH =
         keccak256(
             "Order(address user,uint256 marketId,bool isLong,bool isOpen,uint256 size,uint256 leverage,"
-            "uint256 targetPrice,uint256 maxSlippageBps,uint64 deadline,uint256 channel,uint256 nonce)"
+            "uint256 targetPrice,uint256 maxSlippageBps,uint64 deadline,uint256 channel,uint256 nonce,"
+            "address builder,uint256 builderFeePpm)"
         );
 
     IERC20  public immutable override usdm;
     uint256 internal immutable _usdmDenom;
     IH2Oracle internal immutable _oracle;
 
+    /// @dev Order-driven fee/cut credit routing: the builder + its per-order rate. Threaded
+    /// from the signed order to every fee site so a close can carry a different builder than
+    /// the open (users are never locked to one). `feePpm == 0` or an unregistered builder ⇒
+    /// no cut (the vault keeps it).
+    struct BuilderRef {
+        address builder;
+        uint256 feePpm;
+    }
+
     // ---- markets (all frozen at createMarket) ----
 
     mapping(uint256 => FeeParams)    internal _fees;
     mapping(uint256 => RiskParams)   internal _risk;
     mapping(uint256 => OracleParams) internal _oracles;
+    mapping(uint256 => SpreadParams) internal _spread;
     mapping(uint256 => address) internal _creatorOf;
     mapping(uint256 => address) internal _tokenOf;
+    /// @notice Per-market builder registry (frozen at createMarket; 0 = builder codes disabled).
+    /// The eligibility criteria live in that external contract, not here, so they can change by
+    /// pointing a new market at a new registry. See IBuilderRegistry.
+    mapping(uint256 => address) internal _builderRegistry;
     uint256 public override nextMarketId;
+
+    // ---- builder codes (accrual only; eligibility lives in the per-market registry) ----
+
+    /// @notice A builder's accrued, claimable fees (USDM). The market holds and pays these;
+    /// the registry only gates who may accrue them.
+    mapping(address => uint256) public override builderOwed;
 
     // ---- positions ----
 
-    /// @notice Packed to 6 slots. `realizedPnl` stores the EFFECTIVE PnL (pnl − funding −
-    /// close fee); the split is recoverable from the close events.
+    /// @notice Packed to 7 slots (slot 6 holds `lastActionBlock`). `realizedPnl` stores the
+    /// EFFECTIVE PnL (pnl − funding − close fee); the split is recoverable from the close events.
     struct Position {
         // Slot 0
         address user;     // 20
@@ -163,6 +185,32 @@ abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
         if (t > 1e14) return t / 1_000_000;
         if (t > 1e11) return t / 1_000;
         return t;
+    }
+
+    // ---- builder eligibility ----
+
+    /// @dev Is `builder` eligible on `marketId`, per that market's frozen registry? False when
+    /// the market has no registry (0) or the builder is 0. The registry is an external,
+    /// market-creator-chosen contract, so its `isBuilder` is called behind a try/catch: a
+    /// reverting or hostile registry must never brick order execution — it just forfeits the
+    /// builder share to the vault (a `false`).
+    /// @dev Is `builder` eligible on this market's registry? The registry is a caller-chosen
+    /// external contract, so this must NEVER be able to brick or gas-bomb an order — any anomaly
+    /// forfeits the builder share to the vault and the order still executes. A high-level
+    /// try/catch is not enough (it catches neither out-of-gas nor a malformed/garbage return), so
+    /// use a BOUNDED-GAS low-level staticcall with a strict decode:
+    ///   - the 30k gas cap ⇒ an OOG bomb burns at most that (EIP-150 leaves the caller its gas),
+    ///     and it also caps how large a returndata blob the callee can build, so a returndata bomb
+    ///     cannot meaningfully inflate our gas even though the return is copied;
+    ///   - `ret.length == 32` rejects a malformed/garbage or codeless (empty) return;
+    ///   - decoding to uint256 and requiring `== 1` accepts only a clean boolean true (a garbage
+    ///     word decodes without reverting and simply fails the `== 1` test).
+    function _builderEligible(uint256 marketId, address builder) internal view returns (bool) {
+        address reg = _builderRegistry[marketId];
+        if (reg == address(0) || builder == address(0)) return false;
+        (bool success, bytes memory ret) =
+            reg.staticcall{ gas: 30000 }(abi.encodeWithSelector(IBuilderRegistry.isBuilder.selector, builder));
+        return success && ret.length == 32 && abi.decode(ret, (uint256)) == 1;
     }
 
     // ---- tick helpers ----

@@ -86,7 +86,7 @@ contract H2OracleTest is Test {
         IH2Oracle.Call[] memory none = new IH2Oracle.Call[](0);
         vm.prank(op);
         vm.expectRevert(IH2Oracle.RateCapExceeded.selector);
-        oracle.pushWithParams(id, 50_000e18, int64(int256(uint256(RATE_CAP)) + 1), 0, 0, none);
+        oracle.pushWithParams(id, 50_000e18, int64(int256(uint256(RATE_CAP)) + 1), 0, 0, int32(0), none);
     }
 
     function test_markMustBeTickMultiple() public {
@@ -112,7 +112,7 @@ contract H2OracleTest is Test {
         _adv(1);
         IH2Oracle.Call[] memory none = new IH2Oracle.Call[](0);
         vm.prank(op);
-        oracle.pushWithParams(id, 50_000e18, int64(uint64(RATE_CAP)), 0, 0, none); // long pays
+        oracle.pushWithParams(id, 50_000e18, int64(uint64(RATE_CAP)), 0, 0, int32(0), none); // long pays
         _adv(3600);
         // Index projects forward even without a new push.
         assertGt(oracle.indexNow(id, true), int128(0));
@@ -124,14 +124,15 @@ contract H2OracleTest is Test {
         IH2Oracle.Call[] memory none = new IH2Oracle.Call[](0);
         _adv(1);
         vm.prank(op);
-        oracle.pushWithParams(id, 50_000e18, int64(uint64(RATE_CAP)), 0, 2_000, none); // set once
-        // Subsequent hot pushes carry only the mark; rate + spread persist.
+        oracle.pushWithParams(id, 50_000e18, int64(uint64(RATE_CAP)), 0, 2_000, int32(-500), none); // set once
+        // Subsequent hot pushes carry only the mark; rate + vol/skew persist.
         _adv(1);
         vm.prank(op);
         oracle.push(id, 50_100e18);
         IH2Oracle.FeedView memory f = oracle.feedOf(id);
         assertEq(f.rateLong, int64(uint64(RATE_CAP)));
-        assertEq(uint256(f.spreadPpm), 2_000);
+        assertEq(uint256(f.vol), 2_000);
+        assertEq(int256(f.skew), -500);
         assertEq(f.mark, 50_100e18);
         // Funding still accrued over the interval at the sticky rate.
         _adv(3600);
@@ -212,7 +213,7 @@ contract H2OracleTest is Test {
         _mockHp(base);
         IH2Oracle.Call[] memory none = new IH2Oracle.Call[](0);
         vm.prank(op);
-        oracle.pushWithParams(id, 50_000e18, int64(uint64(RATE_CAP)), 0, 0, none); // long rate, index=0
+        oracle.pushWithParams(id, 50_000e18, int64(uint64(RATE_CAP)), 0, 0, int32(0), none); // long rate, index=0
 
         // Project forward on the HP (ms) clock without advancing block.timestamp at all.
         _mockHp(base + 500_000);   // +500 ms

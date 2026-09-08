@@ -7,12 +7,15 @@ import { H2Market }  from "../../src/h2/H2Market.sol";
 import { H2Oracle }  from "../../src/h2/H2Oracle.sol";
 import { IH2Market } from "../../src/h2/IH2Market.sol";
 import { IH2Oracle } from "../../src/h2/IH2Oracle.sol";
+import { BuilderRegistry }  from "../../src/h2/BuilderRegistry.sol";
+import { IBuilderRegistry } from "../../src/h2/IBuilderRegistry.sol";
 import { MockERC20 } from "../mocks/MockERC20.sol";
 import { MockAggregatorV3 } from "../mocks/MockAggregatorV3.sol";
 
 contract H2MarketTest is Test {
     H2Market  internal h;
     H2Oracle  internal oracle;
+    BuilderRegistry internal reg;       // per-market builder eligibility (native-ETH stake)
     MockERC20 internal usdm;
     MockAggregatorV3 internal ref;      // primary feed's reference band
     MockAggregatorV3 internal fallbackFeed;
@@ -37,8 +40,11 @@ contract H2MarketTest is Test {
     bytes32 internal DOMAIN_SEPARATOR;
     bytes32 internal constant ORDER_TYPEHASH = keccak256(
         "Order(address user,uint256 marketId,bool isLong,bool isOpen,uint256 size,uint256 leverage,"
-        "uint256 targetPrice,uint256 maxSlippageBps,uint64 deadline,uint256 channel,uint256 nonce)"
+        "uint256 targetPrice,uint256 maxSlippageBps,uint64 deadline,uint256 channel,uint256 nonce,"
+        "address builder,uint256 builderFeePpm)"
     );
+
+    uint256 internal constant MIN_BUILDER_STAKE = 1e18;
 
     uint256 internal _t;
     // Advancing time also advances the block number: a position may be adjusted at most once per
@@ -68,7 +74,20 @@ contract H2MarketTest is Test {
         return IH2Market.FeeParams({
             openFlatPpm: 500, openLinearScale: 0, openQuadScale: 0,   // 5 bps open
             closeFlatPpm: 500, closeLinearScale: 0, closeQuadScale: 0, // 5 bps close (> 100ppm dev)
-            cutInterceptPpm: 100_000, cutSlopePpm: 100_000, maxCutPpm: 55_000
+            cutInterceptPpm: 100_000, cutSlopePpm: 100_000, maxCutPpm: 55_000,
+            maxBuilderFeePpm: 100_000 // builders may take ≤ 10% of fees+cut
+        });
+    }
+
+    /// @dev Default: no derived spread (zero coefficients). Spread tests use `_spreadK`.
+    function _spread() internal pure returns (IH2Market.SpreadParams memory) {
+        return IH2Market.SpreadParams({ openVolK: 0, openSkewK: 0, closeVolK: 0, closeSkewK: 0 });
+    }
+    function _spreadK(uint32 openVolK, uint32 openSkewK, uint32 closeVolK, uint32 closeSkewK)
+        internal pure returns (IH2Market.SpreadParams memory)
+    {
+        return IH2Market.SpreadParams({
+            openVolK: openVolK, openSkewK: openSkewK, closeVolK: closeVolK, closeSkewK: closeSkewK
         });
     }
     function _risk(uint32 liqWidthPpm) internal pure returns (IH2Market.RiskParams memory) {
@@ -82,7 +101,8 @@ contract H2MarketTest is Test {
             fundingRateCapPerSec: RATE_CAP,
             maxSpreadPpm: 5_000, // ≤ 0.5% operator spread
             unstakeSecs: uint32(TERM),
-            staleSpreadK: 6 // ppm per √ms ≈ 2σ for BTC (≈356 ppm at the 4s sentinel)
+            staleSpreadK: 6, // ppm per √ms ≈ 2σ for BTC (≈356 ppm at the 4s sentinel)
+            minAdjustGapBlocks: 1
         });
     }
     function _oracleParams() internal view returns (IH2Market.OracleParams memory) {
@@ -108,13 +128,18 @@ contract H2MarketTest is Test {
         ref = new MockAggregatorV3(8, 50_000e8, block.timestamp);
         fallbackFeed = new MockAggregatorV3(8, 50_000e8, block.timestamp);
         h = new H2Market(address(usdm), address(oracle));
+        reg = new BuilderRegistry(address(0), MIN_BUILDER_STAKE); // native-ETH stake
         token = makeAddr("btc");
 
         vm.prank(op);
         feedId = oracle.createFeed(op, 1e18, RATE_CAP, RAKE_PPM, address(ref), 8, 100_000, 1 hours);
 
         vm.prank(op);
-        mkt = h.createMarket(token, _fees(), _risk(0), _oracleParams());
+        // Open-side vol + skew coefficients so a pushed vol/skew produces a derived spread (closes
+        // stay 0). volK=2000 ⇒ at vol=10_000 (1%) the base open spread is 2000 ppm; skewK=1000 ⇒
+        // at skew=10_000 (1%) the asymmetry is ±1000 ppm. Every other test pushes vol=skew=0, so
+        // their derived spread is 0 regardless.
+        mkt = h.createMarket(token, _fees(), _risk(0), _oracleParams(), _spreadK(2_000, 1_000, 0, 0), address(reg));
 
         // Open deposits, back the pool with lender capital; publish an initial mark.
         _seedTreasury(mkt, 5_000_000e18);
@@ -144,17 +169,17 @@ contract H2MarketTest is Test {
     }
 
     /// @dev Plain operator mark push (no orders).
-    function _pushMark(uint256 mark, int64 rl, int64 rs, uint32 spread) internal {
+    function _pushMark(uint256 mark, int64 rl, int64 rs, uint32 vol, int32 skew) internal {
         _refresh(mark);
         IH2Oracle.Call[] memory none = new IH2Oracle.Call[](0);
         vm.prank(op);
-        oracle.pushWithParams(feedId, mark, rl, rs, spread, none);
+        oracle.pushWithParams(feedId, mark, rl, rs, vol, skew, none);
     }
 
     function _sign(uint256 pk, IH2Market.Order memory o) internal view returns (bytes memory) {
         bytes32 sh = keccak256(abi.encode(
             ORDER_TYPEHASH, o.user, o.marketId, o.isLong, o.isOpen, o.size, o.leverage,
-            o.targetPrice, o.maxSlippageBps, o.deadline, o.channel, o.nonce));
+            o.targetPrice, o.maxSlippageBps, o.deadline, o.channel, o.nonce, o.builder, o.builderFeePpm));
         (uint8 v, bytes32 r, bytes32 s) =
             vm.sign(pk, keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, sh)));
         return abi.encodePacked(r, s, v);
@@ -164,15 +189,24 @@ contract H2MarketTest is Test {
                     uint256 target, uint256 slip, uint256 nonce)
         internal view returns (IH2Market.Order memory)
     {
+        return _orderB(pk, isLong, isOpen, size, lev, target, slip, nonce, address(0), 0);
+    }
+
+    /// @dev Order with an explicit builder + rate (defaults route through `_order`).
+    function _orderB(uint256 pk, bool isLong, bool isOpen, uint256 size, uint256 lev,
+                     uint256 target, uint256 slip, uint256 nonce, address builder, uint256 builderFeePpm)
+        internal view returns (IH2Market.Order memory)
+    {
         return IH2Market.Order({
             user: vm.addr(pk), marketId: mkt, isLong: isLong, isOpen: isOpen,
             size: size, leverage: lev, targetPrice: target, maxSlippageBps: slip,
-            deadline: uint64(block.timestamp + 1 hours), channel: 0, nonce: nonce
+            deadline: uint64(block.timestamp + 1 hours), channel: 0, nonce: nonce,
+            builder: builder, builderFeePpm: builderFeePpm
         });
     }
 
     /// @dev Operator commits a mark and attaches one order — the primary pull path.
-    function _pushOrder(uint256 mark, IH2Market.Order memory o, bytes memory sig, uint32 spread)
+    function _pushOrder(uint256 mark, IH2Market.Order memory o, bytes memory sig, uint32 vol, int32 skew)
         internal
     {
         _refresh(mark);
@@ -181,7 +215,16 @@ contract H2MarketTest is Test {
         IH2Oracle.Call[] memory calls = new IH2Oracle.Call[](1);
         calls[0] = IH2Oracle.Call({ target: address(h), data: data });
         vm.prank(op);
-        oracle.pushWithParams(feedId, mark, 0, 0, spread, calls);
+        oracle.pushWithParams(feedId, mark, 0, 0, vol, skew, calls);
+    }
+
+    // Skew-defaulting overloads: existing call sites pass a single `vol` (the old spread slot);
+    // with the default market's zero spread coefficients the derived spread is 0 regardless.
+    function _pushMark(uint256 mark, int64 rl, int64 rs, uint32 vol) internal {
+        _pushMark(mark, rl, rs, vol, int32(0));
+    }
+    function _pushOrder(uint256 mark, IH2Market.Order memory o, bytes memory sig, uint32 vol) internal {
+        _pushOrder(mark, o, sig, vol, int32(0));
     }
 
     function _pushLiquidate(uint256 mark, uint256[] memory ids) internal {
@@ -214,20 +257,12 @@ contract H2MarketTest is Test {
         assertEq(h.marketOf(mkt).mark, 50_000e18);
     }
 
-    function test_createRejectsAntiSandwichViolation() public {
-        IH2Market.FeeParams memory f = _fees();
-        f.openFlatPpm = 40; f.closeFlatPpm = 40; // 80 < 100 dev
-        vm.prank(op);
-        vm.expectRevert(IH2Market.BadMarketParams.selector);
-        h.createMarket(token, f, _risk(0), _oracleParams());
-    }
-
     function test_createRejectsTickMismatch() public {
         IH2Market.RiskParams memory r = _risk(0);
         r.priceTick = 1e17; // feed tick is 1e18
         vm.prank(op);
         vm.expectRevert(IH2Market.BadMarketParams.selector);
-        h.createMarket(token, _fees(), r, _oracleParams());
+        h.createMarket(token, _fees(), r, _oracleParams(), _spread(), address(reg));
     }
 
     // ============================================================
@@ -236,9 +271,10 @@ contract H2MarketTest is Test {
 
     function test_openViaPullPathAppliesSpreadAndFee() public {
         _adv(1);
-        // Operator spread 2000 ppm (0.2%); long open pays up: 50_000 × 1.002 = 50_100.
+        // Operator publishes vol = 10_000 (1%); the market's openVolK=2000 derives a 2000 ppm
+        // (0.2%) open spread. Long open pays up: 50_000 × 1.002 = 50_100.
         IH2Market.Order memory o = _order(alicePk, true, true, 1e18, 100, 50_200e18, 200, 0);
-        _pushOrder(50_000e18, o, _sign(alicePk, o), 2_000);
+        _pushOrder(50_000e18, o, _sign(alicePk, o), uint32(10_000));
         uint256 id = h.activePositionId(alice, mkt);
         assertEq(h.positions(id).entryPrice, 50_100e18);
         // collateral = 500e18 notional/lev minus 5bps open fee on 50_100 notional.
@@ -321,7 +357,7 @@ contract H2MarketTest is Test {
     function test_liqWidthTriggersEarly() public {
         // Market with a 1% maintenance width.
         vm.prank(op);
-        uint256 wmkt = h.createMarket(token, _fees(), _risk(10_000), _oracleParams());
+        uint256 wmkt = h.createMarket(token, _fees(), _risk(10_000), _oracleParams(), _spread(), address(reg));
         _seedTreasury(wmkt, 1_000_000e18);
         _adv(1);
         _pushMark(50_000e18, 0, 0, 0);
@@ -331,7 +367,7 @@ contract H2MarketTest is Test {
         IH2Market.Order memory o = IH2Market.Order({
             user: alice, marketId: wmkt, isLong: true, isOpen: true, size: 1e18, leverage: 1000,
             targetPrice: 50_100e18, maxSlippageBps: 200, deadline: uint64(block.timestamp + 1 hours),
-            channel: 0, nonce: 0 });
+            channel: 0, nonce: 0, builder: address(0), builderFeePpm: 0 });
         bytes memory sig = _sign(alicePk, o);
         _refresh(50_000e18);
         bytes memory data = abi.encode(wmkt, uint8(IH2Market.ActionKind.Order_), abi.encode(o, sig));
@@ -415,7 +451,7 @@ contract H2MarketTest is Test {
         IH2Market.RiskParams memory r = _risk(0);
         r.staleSpreadK = 0;
         vm.prank(op);
-        uint256 dmkt = h.createMarket(token, _fees(), r, _oracleParams());
+        uint256 dmkt = h.createMarket(token, _fees(), r, _oracleParams(), _spread(), address(reg));
         _seedTreasury(dmkt, 1_000_000e18);
         _adv(1);
         _refresh(50_000e18);
@@ -426,7 +462,7 @@ contract H2MarketTest is Test {
         IH2Market.Order memory o = IH2Market.Order({
             user: alice, marketId: dmkt, isLong: true, isOpen: true, size: 1e18, leverage: 100,
             targetPrice: 50_200e18, maxSlippageBps: 200, deadline: uint64(block.timestamp + 1 hours),
-            channel: 0, nonce: 0 });
+            channel: 0, nonce: 0, builder: address(0), builderFeePpm: 0 });
         vm.expectRevert(IH2Market.SelfServiceDisabled.selector);
         h.executeAtMark(o, _sign(alicePk, o));
     }
@@ -443,7 +479,7 @@ contract H2MarketTest is Test {
 
         // A second market, mark refreshed, then aged 4s (near the sentinel) → larger spread.
         vm.prank(op);
-        uint256 m2 = h.createMarket(token, _fees(), _risk(0), _oracleParams());
+        uint256 m2 = h.createMarket(token, _fees(), _risk(0), _oracleParams(), _spread(), address(reg));
         _seedTreasury(m2, 1_000_000e18);
         _adv(1); _refresh(50_000e18); vm.prank(op); oracle.push(feedId, 50_000e18);
         _adv(4);
@@ -451,7 +487,7 @@ contract H2MarketTest is Test {
         IH2Market.Order memory o2 = IH2Market.Order({
             user: alice, marketId: m2, isLong: true, isOpen: true, size: 1e18, leverage: 100,
             targetPrice: 50_300e18, maxSlippageBps: 200, deadline: uint64(block.timestamp + 1 hours),
-            channel: 0, nonce: 0 });
+            channel: 0, nonce: 0, builder: address(0), builderFeePpm: 0 });
         vm.prank(keeper);
         uint256 id2 = h.executeAtMark(o2, _sign(alicePk, o2));
         // 4s old pays a strictly wider spread than 1s old → higher entry.
@@ -494,7 +530,7 @@ contract H2MarketTest is Test {
         IH2Market.OracleParams memory op_ = _oracleParams();
         op_.primaryFeedId = uint64(ufeed);
         vm.prank(op);
-        uint256 umkt = h.createMarket(token, _fees(), _risk(0), op_);
+        uint256 umkt = h.createMarket(token, _fees(), _risk(0), op_, _spread(), address(reg));
         usdm.mint(carl, 100e18);
         vm.startPrank(carl);
         usdm.approve(address(h), type(uint256).max);
@@ -546,7 +582,7 @@ contract H2MarketTest is Test {
         IH2Market.OracleParams memory op_ = _oracleParams();
         op_.primaryFeedId = uint64(fid);
         vm.prank(op);
-        uint256 m = h.createMarket(token, _fees(), _risk(0), op_);
+        uint256 m = h.createMarket(token, _fees(), _risk(0), op_, _spread(), address(reg));
         _seedTreasury(m, 1_000_000e18);
 
         // µs clock, 100 ms apart; block.timestamp never advances.
@@ -562,7 +598,7 @@ contract H2MarketTest is Test {
         IH2Market.Order memory o = IH2Market.Order({
             user: alice, marketId: m, isLong: true, isOpen: true, size: 1e18, leverage: 100,
             targetPrice: 50_100e18, maxSlippageBps: 200, deadline: uint64(block.timestamp + 1 hours),
-            channel: 0, nonce: 0 });
+            channel: 0, nonce: 0, builder: address(0), builderFeePpm: 0 });
         {
             bytes memory data = abi.encode(m, uint8(IH2Market.ActionKind.Order_), abi.encode(o, _sign(alicePk, o)));
             IH2Oracle.Call[] memory calls = new IH2Oracle.Call[](1);
@@ -597,7 +633,7 @@ contract H2MarketTest is Test {
         IH2Market.OracleParams memory op_ = _oracleParams();
         op_.primaryFeedId = uint64(fid);
         vm.prank(op);
-        uint256 m = h.createMarket(token, _fees(), _risk(0), op_);
+        uint256 m = h.createMarket(token, _fees(), _risk(0), op_, _spread(), address(reg));
         _seedTreasury(m, 1_000_000e18);
 
         uint256 b = (_t + 1) * 1_000_000;
@@ -610,7 +646,7 @@ contract H2MarketTest is Test {
         IH2Market.Order memory o = IH2Market.Order({
             user: alice, marketId: m, isLong: true, isOpen: true, size: 1e18, leverage: 100,
             targetPrice: 50_100e18, maxSlippageBps: 200, deadline: uint64(block.timestamp + 1 hours),
-            channel: 0, nonce: 0 });
+            channel: 0, nonce: 0, builder: address(0), builderFeePpm: 0 });
         {
             bytes memory data = abi.encode(m, uint8(IH2Market.ActionKind.Order_), abi.encode(o, _sign(alicePk, o)));
             IH2Oracle.Call[] memory calls = new IH2Oracle.Call[](1);
@@ -640,7 +676,7 @@ contract H2MarketTest is Test {
     function test_firstDepositVirtualOffsetSanity() public {
         // A fresh market: first deposit mints shares == assets, share price is exactly 1e18.
         vm.prank(op);
-        uint256 m = h.createMarket(token, _fees(), _risk(0), _oracleParams());
+        uint256 m = h.createMarket(token, _fees(), _risk(0), _oracleParams(), _spread(), address(reg));
         usdm.mint(carl, 1_000e18);
         vm.prank(carl);
         uint256 sh = h.deposit(m, 1_000e18);
@@ -765,70 +801,29 @@ contract H2MarketTest is Test {
     // audit fixes
     // ============================================================
 
-    /// FIX 1: increasing a WINNING position crystallizes the winnings cut at the PRE-increase
-    /// collateral, so padding size/collateral can't dilute the cut a later close would pay. The
-    /// crystallized cut equals what a direct full close of the same gain would take — no dodge.
-    function test_increaseCrystallizesWinningsCutAtOriginalBasis() public {
-        // Path 1 (alice): open 1u @ 50k (100x), close fully at 55k → the cut on the full gain.
-        uint256 idA = _openLong(alicePk, 1e18, 100, 50_000e18, 0);
-        _adv(1);
-        IH2Market.Order memory cA = _order(alicePk, true, false, 1e18, 0, 54_500e18, 200, 1);
-        _pushOrder(55_000e18, cA, _sign(alicePk, cA), 0);
-        uint256 cutDirect = h.positions(idA).makerCutPaid;
-        assertGt(cutDirect, 0, "a big winner pays a cut on a direct close");
-
-        // Path 2 (bob): identical open, then INCREASE at 55k instead of closing.
-        uint256 idB = _openLong(bobPk, 1e18, 100, 50_000e18, 0);
-        IH2Market.VaultView memory vBefore = h.vaultOf(mkt);
-        _adv(1);
-        IH2Market.Order memory incB = _order(bobPk, true, true, 1e18, 100, 55_500e18, 200, 1);
-        _pushOrder(55_000e18, incB, _sign(bobPk, incB), 0);
-
-        // The cut was taken NOW, at the original collateral — same magnitude as the direct close.
-        uint256 cutCrystallized = h.positions(idB).makerCutPaid;
-        assertApproxEqRel(cutCrystallized, cutDirect, 1e15, "increase pays the same cut as a direct close");
-        assertGt(h.vaultOf(mkt).rakeOwed, vBefore.rakeOwed, "the cut was credited (rake grew)");
-        assertEq(h.positions(idB).entryPrice, 55_000e18, "basis rebased to the fill");
-    }
-
-    /// FIX 1 (event): PositionIncreased surfaces the crystallized winnings cut so an indexer can
-    /// read it directly; the field is 0 when nothing was crystallized (flat/loss increase).
-    function test_positionIncreasedEmitsCrystallizedCut() public {
-        // A winning increase: the event's makerCut equals the cut actually crystallized.
-        uint256 idB = _openLong(bobPk, 1e18, 100, 50_000e18, 0);
+    /// FIX 1 (HIGH: cut-evasion): the winnings cut is charged ONLY at close — an increase never
+    /// crystallizes it, never drains the pool, and charges no cut. This kills the dust-increase
+    /// dodge (chunk a gain into sub-intercept crystallizations at 0 cut) that a crystallize-on-
+    /// increase opened, and restores the "opens are never solvency-gated" invariant (MED-4).
+    function test_increaseNeverChargesCutOrDrainsPool() public {
+        uint256 id = _openLong(bobPk, 1e18, 100, 50_000e18, 0);
+        IH2Market.VaultView memory v0 = h.vaultOf(mkt);
+        // Increase while deep in profit (mark 55k).
         _adv(1);
         IH2Market.Order memory inc = _order(bobPk, true, true, 1e18, 100, 55_500e18, 200, 1);
-        vm.recordLogs();
         _pushOrder(55_000e18, inc, _sign(bobPk, inc), 0);
-        uint256 emitted = _increasedMakerCut(vm.getRecordedLogs());
-        assertGt(emitted, 0, "winning increase emits a nonzero cut");
-        assertEq(emitted, h.positions(idB).makerCutPaid, "event cut == crystallized cut");
-
-        // A losing increase crystallizes nothing: the event's makerCut is 0.
-        _openLong(alicePk, 1e18, 100, 50_000e18, 0);
+        assertEq(h.positions(id).makerCutPaid, 0, "increase charges no winnings cut");
+        // No drain: poolAssets only ever grows here (the open fee inflows), never falls.
+        assertGe(h.vaultOf(mkt).poolAssets, v0.poolAssets, "increase never drains the pool (MED-4)");
+        uint256 e = h.positions(id).entryPrice;
+        assertGt(e, 50_000e18); assertLt(e, 55_000e18); // entry BLENDED, not rebased to the fill
+        // The winnings cut is taken at CLOSE.
         _adv(1);
-        IH2Market.Order memory inc2 = _order(alicePk, true, true, 1e18, 100, 49_900e18, 200, 1);
-        vm.recordLogs();
-        _pushOrder(49_800e18, inc2, _sign(alicePk, inc2), 0);
-        assertEq(_increasedMakerCut(vm.getRecordedLogs()), 0, "loss increase emits zero cut");
-    }
-
-    /// Pull the `makerCut` field out of the first PositionIncreased log. Data (non-indexed) is
-    /// (addSize, fillPrice, newSize, newEntryPrice, addCollateral, openFee, makerCut, checkpoint).
-    function _increasedMakerCut(Vm.Log[] memory logs) internal pure returns (uint256) {
-        bytes32 sig = keccak256(
-            "PositionIncreased(uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,int128)"
-        );
-        for (uint256 i = 0; i < logs.length; i++) {
-            if (logs[i].topics[0] == sig) {
-                (, , , , , , uint256 makerCut, ) = abi.decode(
-                    logs[i].data,
-                    (uint256, uint256, uint256, uint256, uint256, uint256, uint256, int128)
-                );
-                return makerCut;
-            }
-        }
-        revert("no PositionIncreased log");
+        IH2Market.Order memory c = _order(bobPk, true, false, 2e18, 0, 54_500e18, 500, 2);
+        _pushOrder(55_000e18, c, _sign(bobPk, c), 0);
+        assertTrue(h.positions(id).closed);
+        assertGt(h.positions(id).makerCutPaid, 0, "the winnings cut is charged at close");
+        assertEq(h.grossOpenNotional(mkt), 0, "OI back to zero");
     }
 
     /// FIX 1 (negative): increasing a LOSING position is not crystallized — the size-weighted
@@ -858,7 +853,7 @@ contract H2MarketTest is Test {
         uint256 id = _openLong(alicePk, 1e18, 100, 50_000e18, 0); // opened this block; mark+fallback fresh
         IH2Market.Order memory inc = _order(alicePk, true, true, 1e18, 100, 50_200e18, 200, 1);
         vm.prank(keeper);
-        vm.expectRevert(IH2Market.SameBlockAction.selector);
+        vm.expectRevert(IH2Market.AdjustmentTooSoon.selector);
         h.executeAtMark(inc, _sign(alicePk, inc));
 
         _adv(1); // next block, time passes
@@ -876,6 +871,275 @@ contract H2MarketTest is Test {
         o.fallbackDecimals = 6;
         vm.prank(op);
         vm.expectRevert(IH2Market.BadMarketParams.selector);
-        h.createMarket(token, _fees(), _risk(0), o);
+        h.createMarket(token, _fees(), _risk(0), o, _spread(), address(reg));
+    }
+
+    // ============================================================
+    // builder codes
+    // ============================================================
+
+    function _registerBuilder(address b) internal {
+        vm.deal(b, MIN_BUILDER_STAKE);
+        vm.prank(b);
+        reg.register{ value: MIN_BUILDER_STAKE }();
+    }
+
+    function test_registerBuilderBelowMinReverts() public {
+        address b = makeAddr("builder");
+        vm.deal(b, MIN_BUILDER_STAKE);
+        vm.prank(b);
+        vm.expectRevert(BuilderRegistry.StakeTooLow.selector);
+        reg.register{ value: MIN_BUILDER_STAKE - 1 }();
+        assertFalse(reg.isBuilder(b));
+    }
+
+    /// A registered builder earns its per-order rate on the OPEN fee and the CLOSE fee + winnings
+    /// cut. The oracle rake is senior (unchanged); the builder's share comes out of the vault residual.
+    function test_builderAccruesOnOpenAndClose() public {
+        address builder = makeAddr("builder");
+        _registerBuilder(builder);
+        assertTrue(reg.isBuilder(builder));
+
+        IH2Market.VaultView memory v0 = h.vaultOf(mkt);
+        _adv(1);
+        IH2Market.Order memory o = _orderB(alicePk, true, true, 1e18, 100, 50_200e18, 200, 0, builder, 100_000);
+        _pushOrder(50_000e18, o, _sign(alicePk, o), 0);
+        uint256 id = h.activePositionId(alice, mkt);
+
+        // Open fee = 50_000 · 5bps = 25e18. Oracle rake = 15% = 3.75e18 (senior). Builder = 10% of
+        // the 21.25e18 residual = 2.125e18.
+        assertApproxEqRel(h.vaultOf(mkt).rakeOwed - v0.rakeOwed, 3.75e18, 1e15, "rake is the full 15%");
+        assertApproxEqRel(h.builderOwed(builder), 2.125e18, 1e15, "builder open share = 10% of residual");
+
+        uint256 owedAfterOpen = h.builderOwed(builder);
+        _adv(1);
+        IH2Market.Order memory c = _orderB(alicePk, true, false, 1e18, 0, 54_500e18, 200, 1, builder, 100_000);
+        _pushOrder(55_000e18, c, _sign(alicePk, c), 0);
+        assertTrue(h.positions(id).closed);
+        assertGt(h.builderOwed(builder), owedAfterOpen, "builder earns the close fee + winnings-cut share");
+    }
+
+    /// A DECREASE pays the order's builder its share of the close fee + realized winnings cut; an
+    /// INCREASE pays its builder the share of the OPEN FEE (increases no longer crystallize a cut).
+    function test_builderAccruesOnDecreaseAndIncrease() public {
+        address builder = makeAddr("builder");
+        _registerBuilder(builder);
+
+        uint256 id = _openLong(alicePk, 2e18, 100, 50_000e18, 0);
+        _adv(1);
+        IH2Market.Order memory dec = _orderB(alicePk, true, false, 1e18, 0, 54_000e18, 500, 1, builder, 100_000);
+        _pushOrder(55_000e18, dec, _sign(alicePk, dec), 0);
+        uint256 owedAfterDec = h.builderOwed(builder);
+        assertGt(owedAfterDec, 0, "builder earns on a decrease (fee + winnings cut)");
+
+        _adv(1);
+        IH2Market.Order memory inc = _orderB(alicePk, true, true, 1e18, 100, 55_500e18, 200, 2, builder, 100_000);
+        _pushOrder(55_000e18, inc, _sign(alicePk, inc), 0);
+        assertTrue(!h.positions(id).closed);
+        assertGt(h.builderOwed(builder), owedAfterDec, "builder earns the increase's open-fee share");
+    }
+
+    /// An UNREGISTERED builder forfeits its share to the vault; the order still executes.
+    function test_unregisteredBuilderForfeitsShareToVault() public {
+        address builder = makeAddr("unreg"); // never staked
+        assertFalse(reg.isBuilder(builder));
+        IH2Market.VaultView memory v0 = h.vaultOf(mkt);
+        _adv(1);
+        IH2Market.Order memory o = _orderB(alicePk, true, true, 1e18, 100, 50_200e18, 200, 0, builder, 100_000);
+        _pushOrder(50_000e18, o, _sign(alicePk, o), 0);
+        assertGt(h.activePositionId(alice, mkt), 0, "order executed");
+        assertEq(h.builderOwed(builder), 0, "unregistered builder earned nothing");
+        // The whole post-rake fee lifted the pool (nothing skimmed for the builder).
+        assertGt(h.vaultOf(mkt).poolAssets, v0.poolAssets, "share went to the vault");
+    }
+
+    /// A per-order builder rate above the market cap reverts (surfaced directly on the self-service path).
+    function test_builderFeeAboveCapReverts() public {
+        address builder = makeAddr("builder");
+        _registerBuilder(builder);
+        _adv(2);
+        fallbackFeed.setAnswer(50_000e8); fallbackFeed.setUpdatedAt(block.timestamp);
+        // cap is 100_000; ask for 200_000.
+        IH2Market.Order memory o = _orderB(bobPk, true, true, 1e18, 100, 50_100e18, 200, 0, builder, 200_000);
+        vm.prank(keeper);
+        vm.expectRevert(IH2Market.BadBuilderFee.selector);
+        h.executeAtMark(o, _sign(bobPk, o));
+    }
+
+    /// A builder claims its accrued fees (USDM) and can unregister to recover its native stake.
+    function test_builderClaimsFeesAndUnregisters() public {
+        address builder = makeAddr("builder");
+        _registerBuilder(builder);
+        _adv(1);
+        IH2Market.Order memory o = _orderB(alicePk, true, true, 1e18, 100, 50_200e18, 200, 0, builder, 100_000);
+        _pushOrder(50_000e18, o, _sign(alicePk, o), 0);
+        uint256 owed = h.builderOwed(builder);
+        assertGt(owed, 0);
+
+        uint256 b0 = usdm.balanceOf(builder);
+        vm.prank(builder);
+        h.claimBuilderFees(builder);
+        assertEq(usdm.balanceOf(builder) - b0, owed, "claimed the accrued USDM");
+        assertEq(h.builderOwed(builder), 0, "owed zeroed");
+
+        uint256 n0 = builder.balance;
+        vm.prank(builder);
+        reg.unregister();
+        assertEq(builder.balance - n0, MIN_BUILDER_STAKE, "native stake returned");
+        assertFalse(reg.isBuilder(builder));
+    }
+
+    /// @dev Open a long naming `builder` at 10% on an arbitrary market `m` (inline so it can target
+    /// a market other than the default `mkt`).
+    function _openWithBuilderOn(uint256 m, uint256 pk, address builder) internal returns (uint256 id) {
+        _adv(1);
+        IH2Market.Order memory o = IH2Market.Order({
+            user: vm.addr(pk), marketId: m, isLong: true, isOpen: true, size: 1e18, leverage: 100,
+            targetPrice: 50_200e18, maxSlippageBps: 200, deadline: uint64(block.timestamp + 1 hours),
+            channel: 0, nonce: 0, builder: builder, builderFeePpm: 100_000
+        });
+        _pushOrderM(m, 50_000e18, o, _sign(pk, o), 0, int32(0));
+        id = h.activePositionId(vm.addr(pk), m);
+    }
+
+    /// A market with NO registry (address(0)) disables builder codes: the order executes and the
+    /// would-be builder share stays with the vault.
+    function test_zeroRegistryForfeitsAndExecutes() public {
+        uint256 zmkt = h.createMarket(token, _fees(), _risk(0), _oracleParams(), _spread(), address(0));
+        address b = makeAddr("b0");
+        uint256 id = _openWithBuilderOn(zmkt, alicePk, b);
+        assertGt(id, 0, "executed with no registry");
+        assertEq(h.builderOwed(b), 0, "builder codes disabled: share to the vault");
+    }
+
+    /// A hostile/broken registry that REVERTS on isBuilder must not brick order execution — the
+    /// try/catch treats a revert as ineligible and forfeits the share to the vault.
+    function test_revertingRegistryForfeitsAndExecutes() public {
+        RevertingRegistry bad = new RevertingRegistry();
+        uint256 rmkt = h.createMarket(token, _fees(), _risk(0), _oracleParams(), _spread(), address(bad));
+        address b = makeAddr("bR");
+        uint256 id = _openWithBuilderOn(rmkt, alicePk, b);
+        assertGt(id, 0, "executed despite a reverting registry");
+        assertEq(h.builderOwed(b), 0, "reverting registry -> forfeit to the vault");
+    }
+
+    // ============================================================
+    // vol/skew → derived spread
+    // ============================================================
+
+    /// The derived spread grows with vol² (variance-like): halving vol quarters the spread.
+    function test_derivedSpreadScalesWithVolSquared() public {
+        // vol=5000 → 2000·5000²/1e8 = 500 ppm → +25 on 50_000 (ceil-to-$1-tick).
+        _adv(1);
+        IH2Market.Order memory oa = _order(alicePk, true, true, 1e18, 100, 50_100e18, 200, 0);
+        _pushOrder(50_000e18, oa, _sign(alicePk, oa), uint32(5_000));
+        uint256 ea = h.positions(h.activePositionId(alice, mkt)).entryPrice;
+
+        // vol=10000 → 2000 ppm → +100.
+        _adv(1);
+        IH2Market.Order memory ob = _order(bobPk, true, true, 1e18, 100, 50_200e18, 200, 0);
+        _pushOrder(50_000e18, ob, _sign(bobPk, ob), uint32(10_000));
+        uint256 eb = h.positions(h.activePositionId(bob, mkt)).entryPrice;
+
+        assertEq(ea, 50_025e18, "vol=5000 gives 500 ppm");
+        assertEq(eb, 50_100e18, "vol=10000 gives 2000 ppm");
+        assertEq(eb - 50_000e18, 4 * (ea - 50_000e18), "spread scales with vol^2");
+    }
+
+    /// Positive skew makes a long open pay a wider spread than a short open (asymmetry).
+    function test_skewMakesLongsPayMoreOnOpen() public {
+        // vol=10000 (base 2000 ppm), skew=10000 (1% ⇒ ±1000 ppm): long 3000 ppm (+150), short 1000 ppm (−50).
+        _adv(1);
+        IH2Market.Order memory ol = _order(alicePk, true, true, 1e18, 100, 50_300e18, 200, 0);
+        _pushOrder(50_000e18, ol, _sign(alicePk, ol), uint32(10_000), int32(10_000));
+        uint256 eLong = h.positions(h.activePositionId(alice, mkt)).entryPrice;
+
+        _adv(1);
+        IH2Market.Order memory os = _order(bobPk, false, true, 1e18, 100, 49_700e18, 200, 0);
+        _pushOrder(50_000e18, os, _sign(bobPk, os), uint32(10_000), int32(10_000));
+        uint256 eShort = h.positions(h.activePositionId(bob, mkt)).entryPrice;
+
+        assertEq(eLong, 50_150e18, "long pays 3000 ppm up");
+        assertEq(eShort, 49_950e18, "short pays only 1000 ppm down");
+        assertGt(eLong - 50_000e18, 50_000e18 - eShort, "skew>0 means longs pay more");
+    }
+
+    /// Zero close coefficients ⇒ zero close spread even under a large pushed vol (the rake prices closes).
+    function test_zeroCloseCoefficientsGiveZeroCloseSpread() public {
+        uint256 id = _openLong(alicePk, 1e18, 100, 50_000e18, 0);
+        _adv(1);
+        IH2Market.Order memory c = _order(alicePk, true, false, 1e18, 0, 49_000e18, 500, 1);
+        _pushOrder(50_000e18, c, _sign(alicePk, c), uint32(50_000)); // huge vol, but closeVolK=0
+        assertTrue(h.positions(id).closed);
+        assertEq(h.positions(id).closePrice, 50_000e18, "close at mark exactly, no derived close spread");
+    }
+
+    /// The derived spread is clamped at the market's maxSpreadPpm.
+    function test_derivedSpreadClampsAtMax() public {
+        // vol=20000 → 8000 ppm uncapped, clamped to maxSpreadPpm=5000 → +250 on 50_000.
+        _adv(1);
+        IH2Market.Order memory o = _order(alicePk, true, true, 1e18, 100, 50_400e18, 200, 0);
+        _pushOrder(50_000e18, o, _sign(alicePk, o), uint32(20_000));
+        assertEq(h.positions(h.activePositionId(alice, mkt)).entryPrice, 50_250e18, "clamped at 5000 ppm");
+    }
+
+    /// The skew-favored side floors at 0 — never a rebate (a fill better than mark).
+    function test_favoredSideFloorsAtZeroNoRebate() public {
+        // short open, vol=5000 (base 500 ppm), skew=10000 (−1000 ppm for shorts): 500−1000 < 0 → 0.
+        _adv(1);
+        IH2Market.Order memory o = _order(bobPk, false, true, 1e18, 100, 49_800e18, 200, 0);
+        _pushOrder(50_000e18, o, _sign(bobPk, o), uint32(5_000), int32(10_000));
+        assertEq(h.positions(h.activePositionId(bob, mkt)).entryPrice, 50_000e18, "floored to 0: fills at mark, no rebate");
+    }
+
+    /// @dev Push an order attached to a mark on an ARBITRARY market (the standard `_pushOrder`
+    /// hardcodes the default `mkt`); lets a test drive a market with its own spread coefficients.
+    function _pushOrderM(uint256 m, uint256 mark, IH2Market.Order memory o, bytes memory sig, uint32 vol, int32 skew)
+        internal
+    {
+        _refresh(mark);
+        bytes memory data = abi.encode(m, uint8(IH2Market.ActionKind.Order_), abi.encode(o, sig));
+        IH2Oracle.Call[] memory calls = new IH2Oracle.Call[](1);
+        calls[0] = IH2Oracle.Call({ target: address(h), data: data });
+        vm.prank(op);
+        oracle.pushWithParams(feedId, mark, 0, 0, vol, skew, calls);
+    }
+
+    /// Skew keys off the taker's FILL DIRECTION, not the position side. On a market that skews
+    /// closes, a long CLOSE is a SELL, so with skew>0 it gets the REBATED (smaller) spread —
+    /// base − skew — not the widened one. (Position-side keying would have charged base + skew.)
+    /// This is the only leg where the two conventions diverge (on opens `up == isLong`).
+    function test_skewOnCloseKeysOffFillDirection() public {
+        // Market skews CLOSES only: closeVolK=2000, closeSkewK=1000 (open coefficients 0).
+        uint256 cmkt = h.createMarket(token, _fees(), _risk(0), _oracleParams(), _spreadK(0, 0, 2_000, 1_000), address(reg));
+
+        _adv(1); // open a long at the mark (zero open spread)
+        IH2Market.Order memory oo = IH2Market.Order({
+            user: alice, marketId: cmkt, isLong: true, isOpen: true, size: 1e18, leverage: 100,
+            targetPrice: 50_000e18, maxSlippageBps: 200, deadline: uint64(block.timestamp + 1 hours),
+            channel: 0, nonce: 0, builder: address(0), builderFeePpm: 0
+        });
+        _pushOrderM(cmkt, 50_000e18, oo, _sign(alicePk, oo), 0, int32(0));
+        uint256 id = h.activePositionId(alice, cmkt);
+
+        _adv(1); // close the long (a SELL) with vol=10000 (base 2000ppm), skew=10000 (±1000ppm)
+        IH2Market.Order memory oc = IH2Market.Order({
+            user: alice, marketId: cmkt, isLong: true, isOpen: false, size: 1e18, leverage: 0,
+            targetPrice: 49_000e18, maxSlippageBps: 500, deadline: uint64(block.timestamp + 1 hours),
+            channel: 0, nonce: 1, builder: address(0), builderFeePpm: 0
+        });
+        _pushOrderM(cmkt, 50_000e18, oc, _sign(alicePk, oc), 10_000, int32(10_000));
+
+        assertTrue(h.positions(id).closed, "closed");
+        // Sell ⇒ !up ⇒ spread = base − skew = 2000 − 1000 = 1000 ppm down → 49_950 (rebated),
+        // NOT base + skew = 3000 ppm → 49_850 (what position-side keying would have charged).
+        assertEq(h.positions(id).closePrice, 49_950e18, "long close (sell) gets the rebated 1000ppm");
+    }
+}
+
+/// @dev A builder registry that always reverts — for the market's try/catch safety test.
+contract RevertingRegistry is IBuilderRegistry {
+    function isBuilder(address) external pure override returns (bool) {
+        revert("nope");
     }
 }

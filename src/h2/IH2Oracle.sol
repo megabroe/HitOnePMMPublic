@@ -12,8 +12,9 @@ interface IH2OracleCallback {
 
 /// @title IH2Oracle
 /// @notice Permissionless registry of operator-published price feeds: marks, two-sided
-/// funding rates, an optional volatility spread, and a packed mark-history ring. Ownerless
-/// and immutable, like the exchange that consumes it.
+/// funding rates, a volatility + skew estimate (the consuming market derives its spread from
+/// them), and a packed mark-history ring. Ownerless and immutable, like the exchange that
+/// consumes it.
 ///
 /// A feed is frozen at creation: its `operator` (the only address that may publish),
 /// its `priceTick` (the quantum ring history is recorded in), and optionally a REFERENCE
@@ -54,7 +55,11 @@ interface IH2Oracle {
         int128  fundingIndexShort;
         int64   rateLong;          // signed fixed-point fraction/sec, real = rate/(100·2⁶³)
         int64   rateShort;
-        uint32  spreadPpm;         // operator-published vol spread; consumers cap it
+        uint32  vol;               // operator-published volatility estimate, PPM (10_000 = 1%);
+                                   // the consuming market derives its spread from vol+skew
+        int32   skew;              // operator-published directional skew, signed PPM; shifts the
+                                   // derived spread by FILL DIRECTION (skew>0 ⇒ buyers pay more:
+                                   // opening a long or closing a short)
         uint64  lastPushMs;        // HP wall-clock ms — the single push clock (funding,
                                    // ring, staleness); 0 iff the feed has never been pushed
         uint64  ringHead;
@@ -80,7 +85,8 @@ interface IH2Oracle {
         uint16  timeDeltaMs,
         bool    isSentinel,
         uint256 microTimestamp,
-        uint32  spreadPpm
+        uint32  vol,
+        int32   skew
     );
     event FundingRateChanged(uint256 indexed feedId, int64 rateLong, int64 rateShort, uint64 startTime);
     /// @notice A pull-path callback reverted; the mark and sibling calls stand.
@@ -135,17 +141,19 @@ interface IH2Oracle {
     /// reuses the stored rates and spread.
     function pushAndCall(uint256 feedId, uint256 mark, Call[] calldata calls) external;
 
-    /// @notice Publish a mark AND update the feed's funding rates and spread — the cold
-    /// path, for the rare occasions those move. `calls` may be empty (a pure rate/spread
-    /// update) or carry the usual pull-path callbacks. Same publication rules as `push`;
-    /// the new rates apply from this publication forward (funding up to here accrued at the
-    /// old rates).
+    /// @notice Publish a mark AND update the feed's funding rates and vol/skew estimate — the
+    /// cold path, for the rare occasions those move. `calls` may be empty (a pure rate/vol/skew
+    /// update) or carry the usual pull-path callbacks. Same publication rules as `push`; the new
+    /// rates apply from this publication forward (funding up to here accrued at the old rates).
+    /// `vol`/`skew` are the operator's volatility + directional-skew estimates (PPM); consuming
+    /// markets derive their spread from them.
     function pushWithParams(
         uint256 feedId,
         uint256 mark,
         int64   rateLong,
         int64   rateShort,
-        uint32  spreadPpm,
+        uint32  vol,
+        int32   skew,
         Call[] calldata calls
     ) external;
 

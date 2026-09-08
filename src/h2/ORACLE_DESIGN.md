@@ -40,11 +40,16 @@ Each publication carries:
   data, like marks; the exchange bounds them per market (§3). Each side's
   funding **index** integrates `rate × mark` over time and lives in the feed —
   indices are pure functions of feed history.
-- `spreadPpm` — an optional volatility-responsive spread component. Markets
-  cap it (`maxSpreadPpm`, frozen; 0 = the market ignores the spread oracle
-  entirely), and it can only ever worsen a fill within the user's signed
-  slippage band, so it adds vol-adaptivity without giving the operator fill
-  discretion.
+- `vol`, `skew` — a volatility estimate and a directional-skew estimate (both
+  PPM of price, 10_000 = 1%). The operator publishes these; the CONSUMING
+  MARKET derives its own spread from them via frozen coefficients — per side
+  and per action — `spread = volK·vol²/VOL_REF ± skewK·skew/SKEW_REF`, clamped
+  to `[0, maxSpreadPpm]` (see ParamCatalog.derivedSpread). The `vol²` term
+  prices variance; the linear skew term makes the spread asymmetric (skew>0 ⇒
+  longs pay more). Zeroing the close coefficients gives zero close spread (the
+  winnings rake prices closes). The derived spread can only ever worsen a fill
+  within the user's signed slippage band, so it adds vol-adaptivity without
+  giving the operator fill discretion.
 
 Publication rules: two publications in the same HP millisecond revert; a gap
 above 4.095 s writes a ring sentinel (walk-backs stop there); ring entries are
@@ -52,13 +57,13 @@ tick-quantized deltas, 200 deep.
 
 ### Push and pull
 
-Funding rates and the spread are **sticky feed state** — they rarely move,
-while the mark moves every block — so the hot path carries only the price and
-reuses the stored parameters. (Funding still accrues on every push; the index
+Funding rates and the vol/skew estimate are **sticky feed state** — they rarely
+move, while the mark moves every block — so the hot path carries only the price
+and reuses the stored parameters. (Funding still accrues on every push; the index
 integrates rate × mark over time regardless of whether the rate value changed.)
 
 - **Push** — `push(feedId, mark)`: the per-block publication, reusing the
-  stored rates and spread.
+  stored rates and vol/skew.
 - **Pull** — `pushAndCall(feedId, mark, Call[] calls)`: the same, plus a
   synchronous callback to each listed target
   (`IH2OracleCallback.onMark(feedId, data)`). This is how a user's order
@@ -67,9 +72,9 @@ integrates rate × mark over time regardless of whether the rate value changed.)
   operator attaches it to the next mark commit, and the order executes against
   exactly that mark, in that transaction. Nothing observable exists to
   front-run.
-- **Update** — `pushWithParams(feedId, mark, rateLong, rateShort, spreadPpm,
-  Call[] calls)`: the cold path for the rare occasions rates or the spread
-  move. `calls` may be empty (a pure parameter change) or carry the usual
+- **Update** — `pushWithParams(feedId, mark, rateLong, rateShort, vol, skew,
+  Call[] calls)`: the cold path for the rare occasions rates or the vol/skew
+  estimate move. `calls` may be empty (a pure parameter change) or carry the usual
   callbacks. All three entrypoints run the same accrual, so funding is always
   computed at a publication boundary.
 
@@ -89,8 +94,8 @@ pays for the risk that the mark is wrong. There are three tiers.
 ### 2.1 Operator-attached (freshest)
 
 The operator commits a new mark and attaches the order in the same
-`pushAndCall` (§1). Mark age ≈ 0, so the only spread is the feed's own
-`spreadPpm`. This is the cheapest fill and the normal path — the operator's
+`pushAndCall` (§1). Mark age ≈ 0, so the only spread is the market's derived
+spread from the feed's vol/skew. This is the cheapest fill and the normal path — the operator's
 service is keeping marks fresh so its users pay the least — but it is not the
 *only* path.
 
@@ -197,21 +202,20 @@ With those, the contract quotes:
   the same widened threshold. On the fallback path the liquidation spread
   shifts the test price in the position's favor.
 
-### The anti-sandwich bound
+### On sandwiching the treasury (no fee-floor bound)
 
-Because fills are formulaic, the profitability of a round trip against the
-treasury is bounded by how far the executing price can sit from truth — which
-is bounded by `maxDeviationPpm`. `createMarket` therefore enforces,
-structurally:
-
-```
-openFlatPpm + closeFlatPpm  ≥  maxDeviationPpm
-```
-
-using the fee curves' *minimums* (flat terms), so neither a zero spread oracle
-nor zero size can weaken it. A market whose parameters would let deviation
-exceed round-trip cost — a treasury that pays you to trade the oracle gap —
-cannot be created. The remaining creation-time bounds carry over: band and
+Because fills are formulaic, a round trip could in principle extract up to
+`2 · maxDeviationPpm · notional` — but only if the operator parks the mark at
+opposite gate edges (open cheap, close dear) across the two legs. That requires a
+**dishonest feed**: an honest operator's mark tracks truth, so both legs execute
+at ~truth and the gap is ~0. And a dishonest operator that *can* place marks
+`maxDeviationPpm` off truth can already do far worse (arbitrary marks within the
+gate, forced liquidations) — the vault trusts its price feed by construction. So
+the exchange does **not** impose a fee-floor tying `openFlat`/`closeFlat` to
+`maxDeviationPpm`; guarding one narrow extraction while trusting the operator for
+everything else buys nothing. The deviation gate (§2.4) remains, as a
+staleness/sanity check against a *stale or diverged* fallback — not as protection
+against the operator itself. The remaining creation-time bounds carry over: band and
 spread caps, `termSecs ∈ [1 h, 365 d]`, and the coupled funding ceiling
 (`maxFundingRatePerSec × primaryStaleSecs × maxLeverage ≤ ½·PCT_SCALE` — the
 funding accrued during the window users cannot exit without the operator can

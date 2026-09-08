@@ -18,14 +18,23 @@ abstract contract H2Orders is H2Storage {
         bytes32 sh = keccak256(abi.encode(
             ORDER_TYPEHASH,
             o.user, o.marketId, o.isLong, o.isOpen, o.size, o.leverage,
-            o.targetPrice, o.maxSlippageBps, o.deadline, o.channel, o.nonce
+            o.targetPrice, o.maxSlippageBps, o.deadline, o.channel, o.nonce,
+            o.builder, o.builderFeePpm
         ));
         return _hashTypedDataV4(sh);
     }
 
-    /// @dev Verify sig + consume nonce. Submitter authorization is the CALLER's concern.
+    /// @dev Verify sig + consume nonce, and bound the builder fee. Submitter authorization is
+    /// the CALLER's concern. The builder rate the user SIGNED must sit within the market's cap;
+    /// a rate with no builder is malformed. (Whether the named builder is registered is checked
+    /// at accrual time — an unregistered builder simply forfeits the share to the vault.)
     function _verifyAndConsumeOrder(Order memory o, bytes memory sig) internal {
         if (block.timestamp > o.deadline) revert OrderExpired();
+        if (o.builder == address(0)) {
+            if (o.builderFeePpm != 0) revert BadBuilderFee();
+        } else if (o.builderFeePpm > _fees[o.marketId].maxBuilderFeePpm) {
+            revert BadBuilderFee();
+        }
         if (nonceUsed[o.user][o.channel][o.nonce]) revert NonceAlreadyUsed();
         address signer = ECDSA.recover(_orderDigest(o), sig);
         if (signer != o.user) revert BadUserSig();

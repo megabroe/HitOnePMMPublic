@@ -94,13 +94,46 @@ _credit(marketId, amount):
   recipient is read live from the feed, so it tracks the operator, not a stored
   address.
 
+## Builder codes
+
+An order may name a **builder** (an address) and a **`builderFeePpm`** — both
+inside the user's signed order, so the user consents to the referral and its
+rate. The market freezes a cap (`maxBuilderFeePpm`); an order's rate must sit at
+or under it. The builder is per-order, so a user can open through one builder and
+close through another (never locked in). The winnings realized on a decrease or
+an increase-crystallization pay the order's builder too, not just the flat fees.
+
+Builder **eligibility lives in a separate contract**, not in the market: each
+market freezes an `IBuilderRegistry` address at creation (`builderRegistryOf`;
+`address(0)` disables builder codes for that market), and the market only ever
+asks it `isBuilder(addr)`. So the criteria — what is staked, how much, any other
+rule — are not frozen into the immutable market; changing them is deploying a new
+registry and pointing new markets at it. The market reads the registry behind a
+try/catch, so a reverting or hostile registry can never brick order execution —
+it just forfeits the builder share to the vault (as does an order naming an
+ineligible or zero builder; no revert either way). The reference `BuilderRegistry`
+gates on a stake (native ETH, or an ERC-20 such as MEGA — configurable, since ETH,
+not MEGA, is MegaETH's gas token) so naming yourself as builder is not a free
+rebate; it costs the same locked stake as anyone else. Accrued fees live in the
+market: builders `claimBuilderFees` there; they `register`/`unregister` in the
+registry to gain/recover eligibility and their stake.
+
+**Fee waterfall (oracle-senior):** on every order-driven fee/cut, the oracle rake
+is skimmed FIRST and is untouched by the builder; the builder then takes its share
+of the **vault residual** (`(amount − rake) · builderFeePpm`), and only the rest
+lifts the share price. So builders are paid out of what would have gone to lenders,
+never out of the operator's rake.
+
 ## Settlement hooks
 
-The position paths settle against the vault through exactly two internal calls:
+The position paths settle against the vault through two internal credit calls
+(`_credit` for non-order flows, `_creditWithBuilder` for order-driven fees/cut)
+plus `_drainPool`:
 
-- **`_credit`** — every trading earning enters here (open/close fees, the winnings
-  cut, trader losses, liquidation wipes). It skims the rake and adds the remainder
-  to `poolAssets`, lifting the share price for lenders.
+- **`_credit` / `_creditWithBuilder`** — every trading earning enters here
+  (open/close fees, the winnings cut, trader losses, liquidation wipes). It skims
+  the rake, splits out any builder share (order-driven credits only), and adds the
+  remainder to `poolAssets`, lifting the share price for lenders.
 - **`_drainPool`** — a trader win leaves here. It reverts `Insolvent` if
   `poolAssets` cannot cover the payout, and otherwise subtracts it. **Opens are
   never solvency-gated** — only payouts are — so a market can always take new risk;

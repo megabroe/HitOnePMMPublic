@@ -20,12 +20,15 @@ abstract contract H2Markets is H2Storage {
         address token,
         FeeParams calldata fees_,
         RiskParams calldata risk_,
-        OracleParams calldata oracles_
+        OracleParams calldata oracles_,
+        SpreadParams calldata spread_,
+        address builderRegistry
     ) external override returns (uint256 marketId) {
         if (token == address(0)) revert BadMarketParams();
         FeeParams memory f = fees_;
         RiskParams memory r = risk_;
         OracleParams memory o = oracles_;
+        SpreadParams memory sp = spread_;
 
         // ---- fees ----
         if (f.openFlatPpm  > ParamCatalog.MAX_FEE_PPM ||
@@ -33,6 +36,19 @@ abstract contract H2Markets is H2Storage {
         if (f.openLinearScale  > PPM || f.openQuadScale  > PPM ||
             f.closeLinearScale > PPM || f.closeQuadScale > PPM) revert BadMarketParams();
         if (f.maxCutPpm > ParamCatalog.MAX_HOUSE_CUT_PPM) revert BadMarketParams();
+        if (f.maxBuilderFeePpm > 500_000) revert BadMarketParams(); // builder share cap ≤ 50%
+
+        // ---- spread parameterization (vol/skew → derived spread) ----
+        // Bound the coefficients so the derived-spread intermediate can't be absurd; the
+        // per-fill cap (maxSpreadPpm) clamps the result regardless. All-zero (incl. zero close
+        // coefficients for zero close spread) is a valid, supported config.
+        if (sp.openVolK > 1e9 || sp.openSkewK > 1e9 ||
+            sp.closeVolK > 1e9 || sp.closeSkewK > 1e9) revert BadMarketParams();
+        // maxSpreadPpm == 0 clamps the derived spread to 0 on every fill; reject a market that
+        // pairs it with nonzero coefficients (a silent no-op the creator surely didn't intend).
+        if (r.maxSpreadPpm == 0 &&
+            (sp.openVolK != 0 || sp.openSkewK != 0 || sp.closeVolK != 0 || sp.closeSkewK != 0))
+            revert BadMarketParams();
 
         // ---- risk ----
         if (r.priceTick == 0 || r.sizeTick == 0) revert BadMarketParams();
@@ -55,6 +71,9 @@ abstract contract H2Markets is H2Storage {
         // keeps the max self-service spread ≤ ~20% (64 × 3125 ≈ 200_000 ppm). 0 disables
         // executeAtMark for the market.
         if (r.staleSpreadK > 3_125) revert BadMarketParams();
+        // ≥ 1: at least a one-block gap between adjustments to a position (0 would let a position be
+        // opened and adjusted in the same block, re-opening the size-fee chunking dodge).
+        if (r.minAdjustGapBlocks == 0 || r.minAdjustGapBlocks > 1_000_000) revert BadMarketParams();
 
         // ---- oracles ----
         IH2Oracle.FeedView memory feed = _oracle.feedOf(o.primaryFeedId); // reverts UnknownFeed
@@ -74,13 +93,11 @@ abstract contract H2Markets is H2Storage {
         if (o.maxDeviationPpm == 0 || o.maxDeviationPpm > 200_000) revert BadMarketParams();
         if (r.maxSpreadPpm > 200_000) revert BadMarketParams();
 
-        // THE ANTI-SANDWICH BOUND. Fills are formulaic, so a round trip's profit against
-        // the treasury is bounded by how far the executing price can sit from truth —
-        // which the deviation gate bounds. Require the MINIMUM round-trip cost (the flat
-        // fee terms; neither size nor the spread oracle can lower them) to exceed it, so
-        // a market whose treasury pays you to trade the oracle gap cannot exist.
-        if (uint256(f.openFlatPpm) + uint256(f.closeFlatPpm) < uint256(o.maxDeviationPpm))
-            revert BadMarketParams();
+        // No anti-sandwich fee-floor: extracting the 2·maxDeviationPpm round-trip gap requires the
+        // operator to park marks at opposite gate edges, i.e. a compromised/dishonest feed — which
+        // can already do far worse (arbitrary marks, forced liquidations). An honest operator's mark
+        // tracks truth, so the gap is ~0. The design trusts the feed operator; the deviation gate
+        // stays as a staleness/sanity check, not as protection against the operator itself.
 
         // The coupled funding ceiling: funding accrued during the window users cannot
         // exit without the operator can never eat more than half of worst-case
@@ -97,8 +114,12 @@ abstract contract H2Markets is H2Storage {
         _fees[marketId]      = f;
         _risk[marketId]      = r;
         _oracles[marketId]   = o;
+        _spread[marketId]    = sp;
         _creatorOf[marketId] = msg.sender;
         _tokenOf[marketId]   = token;
+        // Builder registry is an external, swappable eligibility oracle — the market never
+        // validates it (0 = builder codes disabled); `_builderEligible` reads it behind a try/catch.
+        _builderRegistry[marketId] = builderRegistry;
         // Cache the primary feed's rake — the operator's frozen cut of this market's earnings.
         _vault[marketId].rakePpm = uint32(feed.feeRakePpm);
         emit MarketCreated(marketId, msg.sender, token, f, r, o);
@@ -121,6 +142,15 @@ abstract contract H2Markets is H2Storage {
         if (_creatorOf[marketId] == address(0)) revert UnknownMarket();
         return _oracles[marketId];
     }
+    function spreadParamsOf(uint256 marketId) external view override returns (SpreadParams memory) {
+        if (_creatorOf[marketId] == address(0)) revert UnknownMarket();
+        return _spread[marketId];
+    }
+
+    function builderRegistryOf(uint256 marketId) external view override returns (address) {
+        if (_creatorOf[marketId] == address(0)) revert UnknownMarket();
+        return _builderRegistry[marketId];
+    }
     function marketOf(uint256 marketId) external view override returns (MarketView memory) {
         if (_creatorOf[marketId] == address(0)) revert UnknownMarket();
         IH2Oracle.FeedView memory feed = _oracle.feedOf(_oracles[marketId].primaryFeedId);
@@ -139,6 +169,20 @@ abstract contract H2Markets is H2Storage {
 
     function _feed(uint256 marketId) internal view returns (IH2Oracle.FeedView memory) {
         return _oracle.feedOf(_oracles[marketId].primaryFeedId);
+    }
+
+    /// @dev The market's derived spread (PPM) for one side/action, from the feed's published
+    /// vol/skew and the market's frozen coefficients, capped at `maxSpreadPpm`. Zero close
+    /// coefficients ⇒ zero close spread (the winnings rake prices closes instead).
+    function _derivedSpread(uint256 marketId, IH2Oracle.FeedView memory feed, bool isOpen, bool isLong)
+        internal view returns (uint256)
+    {
+        SpreadParams storage sp = _spread[marketId];
+        (uint32 volK, uint32 skewK) = isOpen ? (sp.openVolK, sp.openSkewK) : (sp.closeVolK, sp.closeSkewK);
+        // Skew keys off the taker's fill direction, not the position side: `up` is true when the
+        // taker is buying (opening a long or closing a short), so skew>0 charges buyers more.
+        bool up = (isLong == isOpen);
+        return ParamCatalog.derivedSpread(feed.vol, feed.skew, volK, skewK, up, _risk[marketId].maxSpreadPpm);
     }
 
     /// @dev One side's funding index projected to now, computed locally from a FeedView

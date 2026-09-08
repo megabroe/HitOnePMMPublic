@@ -44,6 +44,22 @@ interface IH2Market {
         uint32 cutInterceptPpm;  // winnings-cut ramp on percent return (ParamCatalog.houseCut)
         uint32 cutSlopePpm;
         uint32 maxCutPpm;        // ≤ 500_000 (50%)
+        uint32 maxBuilderFeePpm; // ≤ 500_000; cap on a per-order builder's share of fees+cut
+    }
+
+    /// @notice Vol/skew → spread parameterization (see ORACLE_DESIGN.md). The operator
+    /// publishes a `(vol, skew)` estimate on the feed; the contract derives the per-side,
+    /// per-action spread from these frozen coefficients:
+    ///   spread = volK·vol²/VOL_REF ± skewK·skew/SKEW_REF   (clamped to [0, maxSpreadPpm])
+    /// where `+` is applied to the taker's BUY side (skew>0 ⇒ buyers pay more: opening a long or
+    /// closing a short) and `−` to the sell side — by fill direction, not position side. Zero the
+    /// close coefficients for zero close spread (the winnings rake covers closes). See
+    /// `ParamCatalog.derivedSpread` for the scales (vol/skew in PPM, 10_000 = 1%).
+    struct SpreadParams {
+        uint32 openVolK;   // ≤ 1e9; ppm of open spread at 1% vol
+        uint32 openSkewK;  // ≤ 1e9; ppm of open spread per 1% skew (asymmetry)
+        uint32 closeVolK;  // ≤ 1e9; 0 ⇒ zero close spread
+        uint32 closeSkewK; // ≤ 1e9
     }
 
     /// @notice Position and treasury risk bounds. `notionalScale` is derived (leave 0).
@@ -61,12 +77,15 @@ interface IH2Market {
                                       // liquidatable once equity ≤ width × notional-at-mark,
                                       // so the full knockout lands BEFORE bankruptcy
         uint64  fundingRateCapPerSec; // cap on the feed's rates at consumption (100·2⁶³ scale)
-        uint32  maxSpreadPpm;         // cap on the feed's spread oracle; 0 = ignore it
+        uint32  maxSpreadPpm;         // cap on the derived (vol/skew) spread; 0 ⇒ NO derived
+                                      // spread (the clamp pins every fill to 0), NOT "uncapped"
         uint32  unstakeSecs;          // share-vault withdrawal cooldown ([0, 30d]); shares keep
                                       // earning through it — pure exit friction
         uint32  staleSpreadK;         // self-service staleness-spread coefficient, ppm per
                                       // √millisecond of mark age (≈ 2σ); 0 disables
                                       // executeAtMark for this market
+        uint32  minAdjustGapBlocks;   // min blocks between adjustments to one position (≥ 1);
+                                      // bounds size-fee chunking + winnings-cut basis dilution
     }
 
     /// @notice The market's two price sources and the parameters governing failover.
@@ -102,6 +121,9 @@ interface IH2Market {
         uint64  deadline;
         uint256 channel;
         uint256 nonce;
+        address builder;         // 0 = no builder; else earns `builderFeePpm` of this order's
+                                 // fees+cut (must be a registered builder at execution)
+        uint256 builderFeePpm;   // this order's builder share; ≤ the market's maxBuilderFeePpm
     }
 
     /// @notice `onMark` payload kinds. Each oracle Call carries ONE action so the oracle's
@@ -197,7 +219,6 @@ interface IH2Market {
         uint256 newEntryPrice,
         uint256 addCollateral,
         uint256 openFee,
-        uint256 makerCut,   // winnings cut crystallized on this increase (0 if flat/loss)
         int128  newFundingCheckpoint
     );
     event PositionClosed(
@@ -240,6 +261,16 @@ interface IH2Market {
     /// @notice The feed operator claimed the market's accrued rake.
     event RakeClaimed(uint256 indexed marketId, address indexed to, uint256 amount);
 
+    // ---- builder codes (eligibility lives in the per-market IBuilderRegistry) ----
+
+    /// @notice An eligible builder earned `amount` from an order's fees/cut it built.
+    event BuilderFeeAccrued(
+        uint256 indexed marketId, address indexed builder, uint256 indexed positionId,
+        bool isOpenSide, uint256 amount
+    );
+    /// @notice A builder claimed its accrued fees.
+    event BuilderFeesClaimed(address indexed builder, address indexed to, uint256 amount);
+
     // ============================================================
     // errors
     // ============================================================
@@ -260,8 +291,10 @@ interface IH2Market {
     error PositionLiquidatable();  // increase refused while a liquidation is recorded
     error NoneLiquidated();
     error Insolvent();
-    error SameBlockAction();       // a position may be adjusted at most once per block (anti
-                                   // size-fee chunking); wait a block to increase/decrease/close
+    error AdjustmentTooSoon();     // an adjustment (increase/decrease/close) came within
+                                   // `minAdjustGapBlocks` of the position's last one (anti
+                                   // size-fee chunking / basis dilution); wait out the gap
+    error IncreaseAfterExpiry();   // cannot add size to a position past its expiry
 
     error OrderExpired();
     error NonceAlreadyUsed();
@@ -290,6 +323,9 @@ interface IH2Market {
     error ZeroAddress();
     error ZeroAmount();
 
+    // builder codes
+    error BadBuilderFee();    // order names a builder-rate above the market cap, or a rate with no builder
+
     // ============================================================
     // markets
     // ============================================================
@@ -308,8 +344,12 @@ interface IH2Market {
         address token,
         FeeParams calldata fees,
         RiskParams calldata risk,
-        OracleParams calldata oracles
+        OracleParams calldata oracles,
+        SpreadParams calldata spread,
+        address builderRegistry
     ) external returns (uint256 marketId);
+
+    function spreadParamsOf(uint256 marketId) external view returns (SpreadParams memory);
 
     function usdm() external view returns (IERC20);
     function oracle() external view returns (address);
@@ -392,6 +432,25 @@ interface IH2Market {
     /// @notice Claim the market's accrued rake. Only the primary feed's operator; `to`
     /// receives the full `rakeOwed`.
     function claimRake(uint256 marketId, address to) external;
+
+    // ============================================================
+    // builder codes
+    // ============================================================
+
+    /// @notice An order may name a builder + a fee rate ≤ the market's `maxBuilderFeePpm`; if that
+    /// builder is eligible per the market's `IBuilderRegistry`, it earns that share of the order's
+    /// fees and winnings cut. Eligibility CRITERIA (staking, token, amount) live in the external
+    /// registry, not here — a market freezes which registry it trusts at `createMarket`. An order
+    /// naming an ineligible builder simply skips the cut (the vault keeps it); it does not revert.
+    ///
+    /// @notice Claim the caller's accrued builder fees to `to` (USDM). Fees accrue in the market
+    /// as orders fill; the registry only gated eligibility to accrue them.
+    function claimBuilderFees(address to) external;
+
+    /// @notice The caller/builder's accrued, claimable fees (USDM).
+    function builderOwed(address builder) external view returns (uint256);
+    /// @notice The market's frozen builder registry (0 = builder codes disabled for it).
+    function builderRegistryOf(uint256 marketId) external view returns (address);
 
     function vaultOf(uint256 marketId) external view returns (VaultView memory);
     function stakeOf(uint256 marketId, address user) external view returns (StakeView memory);

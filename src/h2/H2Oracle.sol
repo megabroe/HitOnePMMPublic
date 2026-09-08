@@ -23,11 +23,12 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
     uint256 internal constant UNITS_CAP = 1 << 96;
     uint256 internal constant PPM = 1_000_000;
 
-    /// @notice Packed to 5 slots.
+    /// @notice Packed to 6 slots.
     struct Feed {
         // Slot 0
         address operator;   // 20
-        uint32  spreadPpm;  // 4
+        uint32  vol;        // 4 — operator vol estimate (PPM); market derives spread
+        int32   skew;       // 4 — operator directional skew (signed PPM)
         // Slot 1
         uint128 priceTick;   // 1e18-scale quantum
         uint128 currentMark; // priceUnits (mark / priceTick)
@@ -111,14 +112,14 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
         external override nonReentrant onlyOperator(feedId)
     {
         Feed storage f = _feeds[feedId];
-        _push(feedId, mark, f.rateLong, f.rateShort, f.spreadPpm); // reuse sticky params
+        _push(feedId, mark, f.rateLong, f.rateShort, f.vol, f.skew); // reuse sticky params
     }
 
     function pushAndCall(uint256 feedId, uint256 mark, Call[] calldata calls)
         external override nonReentrant onlyOperator(feedId)
     {
         Feed storage f = _feeds[feedId];
-        _push(feedId, mark, f.rateLong, f.rateShort, f.spreadPpm); // reuse sticky params
+        _push(feedId, mark, f.rateLong, f.rateShort, f.vol, f.skew); // reuse sticky params
         _dispatch(feedId, calls);
     }
 
@@ -127,10 +128,11 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
         uint256 mark,
         int64   rateLong,
         int64   rateShort,
-        uint32  spreadPpm,
+        uint32  vol,
+        int32   skew,
         Call[] calldata calls
     ) external override nonReentrant onlyOperator(feedId) {
-        _push(feedId, mark, rateLong, rateShort, spreadPpm);
+        _push(feedId, mark, rateLong, rateShort, vol, skew);
         _dispatch(feedId, calls);
     }
 
@@ -146,7 +148,7 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
         }
     }
 
-    function _push(uint256 feedId, uint256 mark1e18, int64 rateLong, int64 rateShort, uint32 spreadPpm)
+    function _push(uint256 feedId, uint256 mark1e18, int64 rateLong, int64 rateShort, uint32 vol, int32 skew)
         internal
     {
         Feed storage f = _feeds[feedId];
@@ -168,8 +170,9 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
             f.lastPushMs  = nowMs;
             f.rateLong    = rateLong;
             f.rateShort   = rateShort;
-            f.spreadPpm   = spreadPpm;
-            emit MarkPushed(feedId, mark1e18, 0, 0, false, microTs, spreadPpm);
+            f.vol         = vol;
+            f.skew        = skew;
+            emit MarkPushed(feedId, mark1e18, 0, 0, false, microTs, vol, skew);
             if (rateChanged) emit FundingRateChanged(feedId, rateLong, rateShort, uint64(block.timestamp));
             return;
         }
@@ -195,17 +198,18 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
         uint32 entry;
         if (sentinel) {
             entry = MarkRing.sentinelEntry();
-            emit MarkPushed(feedId, mark1e18, priceDelta, 0, true, microTs, spreadPpm);
+            emit MarkPushed(feedId, mark1e18, priceDelta, 0, true, microTs, vol, skew);
         } else {
             entry = MarkRing.packEntry(priceDelta, elapsedUnits);
-            emit MarkPushed(feedId, mark1e18, priceDelta, uint16(elapsedUnits), false, microTs, spreadPpm);
+            emit MarkPushed(feedId, mark1e18, priceDelta, uint16(elapsedUnits), false, microTs, vol, skew);
         }
         MarkRing.writeMarkEntry(_rings[feedId], head, entry);
 
         f.ringHead    = head + 1;
         f.currentMark = uint128(units);
         f.lastPushMs  = nowMs;
-        f.spreadPpm   = spreadPpm;
+        f.vol         = vol;
+        f.skew        = skew;
         if (rateChanged) {
             f.rateLong  = rateLong;
             f.rateShort = rateShort;
@@ -253,7 +257,8 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
             fundingIndexShort: f.fundingIndexShort,
             rateLong:          f.rateLong,
             rateShort:         f.rateShort,
-            spreadPpm:         f.spreadPpm,
+            vol:               f.vol,
+            skew:              f.skew,
             lastPushMs:        f.lastPushMs,
             ringHead:          f.ringHead
         });

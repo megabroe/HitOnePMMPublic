@@ -51,10 +51,9 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
             (Order memory order, bytes memory sig) = abi.decode(payload, (Order, bytes));
             if (order.marketId != marketId) revert FeedMismatch();
             _verifyAndConsumeOrder(order, sig);
-            // The operator's spread oracle applies, capped by the market's frozen bound.
-            uint256 spreadPpm = feed.spreadPpm;
-            uint256 cap = _risk[marketId].maxSpreadPpm;
-            if (spreadPpm > cap) spreadPpm = cap;
+            // The spread is DERIVED from the feed's vol/skew by the market's frozen coefficients
+            // (per side/action), capped by the market's bound.
+            uint256 spreadPpm = _derivedSpread(marketId, feed, order.isOpen, order.isLong);
             _routeOrder(order, _adverseFill(order, feed.mark, spreadPpm, _risk[marketId].priceTick), feed);
         } else {
             uint256[] memory ids = abi.decode(payload, (uint256[]));
@@ -135,15 +134,23 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
             unchecked { collAfterFee -= fee; }
         }
 
-        usdm.safeTransferFrom(order.user, address(this), collateral_);
-        if (fee > 0) _credit(marketId, fee);
-
-        int128 fundingNow = _indexNow(feed, order.isLong);
-
         id = ++nextPositionId;
         if (order.leverage > type(uint16).max) revert BadLeverage();
         if (collAfterFee > type(uint128).max) revert BadSize();
         if (notional > type(uint128).max) revert BadSize();
+
+        usdm.safeTransferFrom(order.user, address(this), collateral_);
+        // Open fee to the vault (post oracle-rake and any builder share); credited under the
+        // now-known `id` so a builder accrual can name the position.
+        if (fee > 0) _creditWithBuilder(marketId, fee, order.builder, order.builderFeePpm, id, true);
+
+        // Flush the OI + active-position writes BEFORE the big struct literal so `newLong`/
+        // `newShort` die first — keeps the stack in bounds under via-IR.
+        openInterestLong[marketId]  = newLong;
+        openInterestShort[marketId] = newShort;
+        activePositionId[order.user][marketId] = id;
+
+        int128 fundingNow = _indexNow(feed, order.isLong);
         _positions[id] = Position({
             user:              order.user,
             openTime:          uint64(block.timestamp),
@@ -166,9 +173,6 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
             makerCutPaid:      0,
             lastActionBlock:   uint64(block.number)
         });
-        activePositionId[order.user][marketId] = id;
-        openInterestLong[marketId]  = newLong;
-        openInterestShort[marketId] = newShort;
 
         emit PositionOpened(
             id, order.user, marketId, order.isLong, order.size,
@@ -187,10 +191,15 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         id = activePositionId[order.user][marketId];
         if (id == 0) revert NoPosition();
         Position storage pos = _positions[id];
-        // One adjustment per block: the size-fee curve is convex, so splitting an increase into
-        // chunks within a single block would dodge its super-linear terms. (Cross-block chunking
-        // still can, but pays a block of price/liquidation risk per slice — the accepted residual.)
-        if (pos.lastActionBlock == uint64(block.number)) revert SameBlockAction();
+        // Adjustment delay: the size-fee curve is convex, so splitting an increase into chunks
+        // within a short window would dodge its super-linear terms. `minAdjustGapBlocks` (frozen,
+        // ≥ 1) sets the gap; together with the open fee on any added size it bounds the residual
+        // basis-dilution of the winnings cut — a dilution pad must add real leveraged size, pay its
+        // open fee, and sit out the gap before it can close.
+        if (block.number < uint256(pos.lastActionBlock) + r.minAdjustGapBlocks) revert AdjustmentTooSoon();
+        // No increase on an expired position: it would push the walk-back floor (openTime/openMs)
+        // forward on a position that should only be settling.
+        if (block.timestamp >= pos.expiresAt) revert IncreaseAfterExpiry();
         if (order.isLong   != pos.isLong)   revert BadUserSig();
         if (order.leverage != pos.leverage) revert BadUserSig();
         // An increase resets openTime/openMs — the walk-back floor — so it must not be
@@ -225,7 +234,7 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         }
 
         usdm.safeTransferFrom(order.user, address(this), addCollateral);
-        if (fee > 0) _credit(marketId, fee);
+        if (fee > 0) _creditWithBuilder(marketId, fee, order.builder, order.builderFeePpm, id, true);
 
         int128 fundingNow = _indexNow(feed, order.isLong);
 
@@ -234,50 +243,31 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         if (newSize >= UNITS_CAP)              revert BadSize();
         if (totalNotional > type(uint128).max) revert BadSize();
 
-        // CRYSTALLIZE THE WINNINGS CUT ON INCREASE.
-        // The cut ramps on percent return (effPnl/col). Blending fresh size + collateral into a
-        // winning position would dilute that return, so a later close would pay a smaller cut than
-        // the position actually earned — a cost-basis reset dodge. Close it by settling the
-        // EXISTING position's unrealized gain at the fill HERE, taking the cut at the PRE-increase
-        // collateral (its true, undiluted return), and rolling the net gain into collateral. Both
-        // the realized old size and the fresh size then enter at the fill, so the basis collapses
-        // to `fillUnits`. A loss/flat position is NOT crystallized (nothing to tax): the
-        // size-weighted blend preserves its unrealized PnL exactly, as before.
-        // The realization price is the increase's own adverse fill (for a long, ≥ mark) —
-        // marginally in the user's favor, and consistent with where the new size enters.
-        (int256 pnl0, int256 funding0, , uint256 cut0) =
-            _settleSlice(pos, pos.size, uint256(pos.col), fillUnits, fundingNow, r, f);
-        int256 effPnl0 = pnl0 - funding0;
-
-        uint256 newCol;
-        uint256 newEntry;
-        int256  newCheckpoint;
-        if (effPnl0 > 0) {
-            _drainPool(marketId, uint256(effPnl0));
-            if (cut0 > 0) _credit(marketId, cut0);
-            newCol        = uint256(pos.col) + addColAfterFee + (uint256(effPnl0) - cut0);
-            newEntry      = uint256(fillUnits);
-            newCheckpoint = int256(fundingNow);
-            pos.makerCutPaid += uint128(cut0);
-        } else {
-            // Size-weighted blends preserve the old size's unrealized PnL and accrued funding
-            // exactly, while the added size enters at the fill / current funding.
-            newCol        = uint256(pos.col) + addColAfterFee;
-            newEntry      = (uint256(pos.entryPrice) * oldSize + uint256(fillUnits) * uint256(addSizeUnits)) / newSize;
-            newCheckpoint =
-                (int256(pos.fundingCheckpoint) * int256(oldSize) + int256(fundingNow) * int256(uint256(addSizeUnits)))
-                / int256(newSize);
-        }
+        // Size-weighted blend for EVERY increase (gain, loss or flat): the added size enters at the
+        // fill and current funding, while the old size keeps its unrealized PnL and accrued funding
+        // exactly. The winnings cut is charged ONLY at close/decrease, on realized effPnl — an
+        // increase never crystallizes a cut, so it cannot be diluted or dust-chunked into evasion,
+        // and it never drains the pool (opens stay solvency-ungated).
+        uint256 newCol   = uint256(pos.col) + addColAfterFee;
+        // Round the blended entry AGAINST the taker (ceil for a long — a higher entry is worse for a
+        // long; floor for a short). Integer division must never favor the taker here, or an
+        // underwater position could walk its entry one priceUnit toward the mark per increase and
+        // erase its unrealized loss straight out of the pool.
+        uint256 num      = uint256(pos.entryPrice) * oldSize + uint256(fillUnits) * uint256(addSizeUnits);
+        uint256 newEntry = pos.isLong ? (num + newSize - 1) / newSize : num / newSize;
+        int256  newCheckpoint =
+            (int256(pos.fundingCheckpoint) * int256(oldSize) + int256(fundingNow) * int256(uint256(addSizeUnits)))
+            / int256(newSize);
         if (newCol > type(uint128).max) revert BadSize();
 
         pos.entryPrice        = uint128(newEntry);
         pos.size              = uint128(newSize);
         pos.col               = uint128(newCol);
         pos.fundingCheckpoint = int128(newCheckpoint);
-        // OI-consistent sum (open + this add); NOT rebased to the fill, so `_decreaseOI` on close
-        // unwinds exactly what open/increase added.
+        // OI-consistent sum (open + this add); NOT rebased, so `_decreaseOI` on close unwinds
+        // exactly what open/increase added.
         pos.notionalAtOpen    = uint128(totalNotional);
-        // The (rebased or blended) entry only becomes valid now; the walk-back floor moves with it.
+        // The blended entry only becomes valid now; the walk-back floor moves with it.
         pos.openTime          = uint64(block.timestamp);
         pos.openMs            = uint64(_microTimestamp() / 1000);
         pos.lastActionBlock   = uint64(block.number);
@@ -285,13 +275,11 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         openInterestLong[marketId]  = newLong;
         openInterestShort[marketId] = newShort;
 
-        // Read the just-written pos fields (identical to the newSize/newEntry/newCheckpoint
-        // locals) so those locals can die before the emit — keeps the stack in bounds.
         emit PositionIncreased(
             id, marketId, order.size, fill1e18,
-            _sizeOut(pos.size, r.sizeTick),
-            _priceOut(pos.entryPrice, r.priceTick),
-            addColAfterFee, fee, cut0, pos.fundingCheckpoint
+            _sizeOut(uint128(newSize), r.sizeTick),
+            _priceOut(uint128(newEntry), r.priceTick),
+            addColAfterFee, fee, int128(newCheckpoint)
         );
     }
 
@@ -306,9 +294,9 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         uint256 id = activePositionId[order.user][marketId];
         if (id == 0) revert NoPosition();
         Position storage pos = _positions[id];
-        // One adjustment per block (see _increasePosition): a partial close is an adjustment too,
-        // so chunking a close within a block cannot dodge the convex close-fee curve.
-        if (pos.lastActionBlock == uint64(block.number)) revert SameBlockAction();
+        // Adjustment delay (see _increasePosition): a partial close is an adjustment too, so
+        // chunking a close within the gap cannot dodge the convex close-fee curve.
+        if (block.number < uint256(pos.lastActionBlock) + r.minAdjustGapBlocks) revert AdjustmentTooSoon();
         // The signed side must match: the adverse-fill direction derives from it.
         if (order.isLong != pos.isLong) revert BadUserSig();
         uint128 closeSizeUnits = _toSizeUnits(order.size, r.sizeTick);
@@ -329,10 +317,13 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         }
 
         uint128 fillUnits = _toPriceUnits(fill1e18, r.priceTick);
+        // A close/decrease pays its own order's builder — so a user can close via a different
+        // builder than they opened with (never locked in).
+        BuilderRef memory b = BuilderRef({ builder: order.builder, feePpm: order.builderFeePpm });
         if (closeSizeUnits == pos.size) {
-            _settleClose(id, fillUnits, feed, true);
+            _settleClose(id, fillUnits, feed, true, b);
         } else {
-            _settleDecrease(id, closeSizeUnits, fillUnits, feed);
+            _settleDecrease(id, closeSizeUnits, fillUnits, feed, b);
         }
     }
 
@@ -347,12 +338,14 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         // mark IS the documented exit.
         if (feed.lastPushMs == 0) revert PrimaryNeverPushed();
         uint128 markUnits = uint128(feed.mark / _risk[marketId].priceTick);
-        // Expiry is a forced event: no close fee.
-        uint256 payout_ = _settleClose(id, markUnits, feed, false);
+        // Expiry is a forced event: no close fee, no order → no builder.
+        uint256 payout_ = _settleClose(id, markUnits, feed, false, BuilderRef({ builder: address(0), feePpm: 0 }));
         emit PositionExpired(id, _priceOut(markUnits, _risk[marketId].priceTick), payout_);
     }
 
-    function _settleClose(uint256 id, uint128 closeUnits, IH2Oracle.FeedView memory feed, bool chargeCloseFee)
+    function _settleClose(
+        uint256 id, uint128 closeUnits, IH2Oracle.FeedView memory feed, bool chargeCloseFee, BuilderRef memory b
+    )
         internal returns (uint256)
     {
         Position storage pos = _positions[id];
@@ -365,10 +358,10 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
 
         uint256 closeFee = 0;
         if (chargeCloseFee) {
-            (payout, closeFee) = _chargeCloseFee(marketId, closeUnits, pos.size, payout);
+            (payout, closeFee) = _chargeCloseFee(marketId, closeUnits, pos.size, payout, b, id);
         }
 
-        _applyTreasuryDelta(marketId, uint256(pos.col), pnl, fundingPaid, cut);
+        _applyTreasuryDelta(marketId, uint256(pos.col), pnl, fundingPaid, cut, b, id);
         _decreaseOI(marketId, pos.isLong, uint256(pos.notionalAtOpen));
 
         int256 effPnlNet = pnl - fundingPaid - int256(closeFee);
@@ -385,7 +378,9 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         return payout;
     }
 
-    function _settleDecrease(uint256 id, uint128 closeSizeUnits, uint128 closeUnits, IH2Oracle.FeedView memory feed)
+    function _settleDecrease(
+        uint256 id, uint128 closeSizeUnits, uint128 closeUnits, IH2Oracle.FeedView memory feed, BuilderRef memory b
+    )
         internal
     {
         Position storage pos = _positions[id];
@@ -398,17 +393,12 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         (int256 pnl, int256 fundingPaid, uint256 payout, uint256 cut) =
             _settleSlice(pos, closeSizeUnits, colPortion, closeUnits, fundingNow, r, _fees[marketId]);
 
-        (payout, ) = _chargeCloseFee(marketId, closeUnits, closeSizeUnits, payout);
+        // Capture the CHARGED close fee (min(fee, pre-fee payout)) directly — consistent with
+        // _settleClose, and it drops the recompute's locals that pushed this over the stack limit.
         uint256 closeFee;
-        {
-            // recompute for the event (charged amount is min(fee, pre-fee payout))
-            uint256 closeNotional = _notional(closeUnits, closeSizeUnits, r.notionalScale);
-            FeeParams storage f = _fees[marketId];
-            uint256 feePpm = ParamCatalog.sizeFeePpm(closeNotional, _usdmDenom, f.closeFlatPpm, f.closeLinearScale, f.closeQuadScale);
-            closeFee = closeNotional * feePpm / PPM;
-        }
+        (payout, closeFee) = _chargeCloseFee(marketId, closeUnits, closeSizeUnits, payout, b, id);
 
-        _applyTreasuryDelta(marketId, colPortion, pnl, fundingPaid, cut);
+        _applyTreasuryDelta(marketId, colPortion, pnl, fundingPaid, cut, b, id);
 
         uint256 notionalPortion = uint256(pos.notionalAtOpen) * closeSizeUnits / pos.size;
         _decreaseOI(marketId, pos.isLong, notionalPortion);
@@ -430,7 +420,10 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
     /// @dev Charge the close-fee curve on the closed notional, bounded by what is actually
     /// leaving (a fee can never exceed the payout it is charged against). The charged
     /// amount is treasury revenue.
-    function _chargeCloseFee(uint256 marketId, uint128 closeUnits, uint128 closeSizeUnits, uint256 payout)
+    function _chargeCloseFee(
+        uint256 marketId, uint128 closeUnits, uint128 closeSizeUnits, uint256 payout,
+        BuilderRef memory b, uint256 positionId
+    )
         internal returns (uint256 newPayout, uint256 charged)
     {
         RiskParams storage r = _risk[marketId];
@@ -439,7 +432,7 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         uint256 feePpm = ParamCatalog.sizeFeePpm(closeNotional, _usdmDenom, f.closeFlatPpm, f.closeLinearScale, f.closeQuadScale);
         uint256 fee = closeNotional * feePpm / PPM;
         charged = fee < payout ? fee : payout;
-        if (charged > 0) _credit(marketId, charged);
+        if (charged > 0) _creditWithBuilder(marketId, charged, b.builder, b.feePpm, positionId, false);
         newPayout = payout - charged;
     }
 
@@ -460,17 +453,21 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
     /// @dev Route a settlement's PnL through the lending pool. `effPnl > 0` drains the pool
     /// and credits the cut back; `effPnl < 0` credits the loss (capped at the slice's
     /// collateral).
-    function _applyTreasuryDelta(uint256 marketId, uint256 posCol, int256 pnl, int256 fundingPaid, uint256 cut)
+    function _applyTreasuryDelta(
+        uint256 marketId, uint256 posCol, int256 pnl, int256 fundingPaid, uint256 cut,
+        BuilderRef memory b, uint256 positionId
+    )
         internal
     {
         int256 effPnl = pnl - fundingPaid;
         if (effPnl > 0) {
             _drainPool(marketId, uint256(effPnl));
-            if (cut > 0) _credit(marketId, cut);
+            // The winnings cut is a fee the builder shares in (isOpenSide = false: it's a close).
+            if (cut > 0) _creditWithBuilder(marketId, cut, b.builder, b.feePpm, positionId, false);
         } else if (effPnl < 0) {
             uint256 loss = uint256(-effPnl);
             if (loss > posCol) loss = posCol;
-            if (loss > 0) _credit(marketId, loss);
+            if (loss > 0) _credit(marketId, loss); // a loss is not a fee — no builder share
         }
     }
 
@@ -558,7 +555,11 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
 
         uint128 markAtK  = uint128(feed.mark / r.priceTick);
         bool    isLong   = pos.isLong;
-        int128  indexAtK = _indexNow(feed, isLong);
+        // Seed the index at the value COMMITTED at the last push (not `_indexNow`, which
+        // extrapolates to `block.timestamp`): the current mark is as-of `lastPushMs`, so its
+        // funding index must be too, or every step of the walk carries a constant
+        // rate·mark·(now − lastPushMs) bias against the paying side.
+        int128  indexAtK = isLong ? feed.fundingIndexLong : feed.fundingIndexShort;
         // The ring's ms clock — the SAME clock `openMs` was stamped on. The current mark is
         // post-open (guarded above), so the walk rewinds this exactly to exclude pre-open
         // marks; at production sub-second cadence a floored-seconds clock would not move and
@@ -579,11 +580,13 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
             if (MarkRing.isSentinel(markE)) return (false, 0, 0);
             (int256 priceDelta, uint256 timeDeltaMs) = MarkRing.unpackEntry(markE);
             uint64 stepMs = uint64(timeDeltaMs * MarkRing.GAP_UNIT_MS);
-            // msAtK now names the timestamp of the mark we step back TO.
-            msAtK   -= stepMs;
-            indexAtK = FundingIndex.stepBackPctMs(indexAtK, rateSide, uint256(markAtK) * r.priceTick, stepMs);
             int256 prev = int256(uint256(markAtK)) - priceDelta;
             if (prev <= 0) return (false, 0, 0);
+            // msAtK now names the timestamp of the mark we step back TO (the older `prev`).
+            msAtK -= stepMs;
+            // Step the index back over this segment at the OLDER mark (`prev`) — the mark actually
+            // held during the interval, matching how `_push` integrated it forward.
+            indexAtK = FundingIndex.stepBackPctMs(indexAtK, rateSide, uint256(prev) * r.priceTick, stepMs);
             markAtK = uint128(uint256(prev));
             // This mark predates the position; the ring is strictly older from here, so stop.
             if (msAtK < pos.openMs) return (false, 0, 0);
