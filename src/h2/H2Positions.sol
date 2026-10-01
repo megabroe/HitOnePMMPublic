@@ -125,7 +125,7 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         uint256 newShort = openInterestShort[marketId];
         if (order.isLong) newLong  += notional;
         else              newShort += notional;
-        _checkOICaps(r, newLong, newShort);
+        _checkOICaps(r, marketId, newLong, newShort);
 
         uint256 fee = (notional * feePpm) / PPM;
         uint256 collAfterFee = collateral_;
@@ -224,7 +224,7 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         uint256 newLong  = openInterestLong[marketId];
         uint256 newShort = openInterestShort[marketId];
         if (order.isLong) newLong += addNotional; else newShort += addNotional;
-        _checkOICaps(r, newLong, newShort);
+        _checkOICaps(r, marketId, newLong, newShort);
 
         uint256 fee = (addNotional * feePpm) / PPM;
         uint256 addColAfterFee = addCollateral;
@@ -481,11 +481,21 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         }
     }
 
-    function _checkOICaps(RiskParams storage r, uint256 newLong, uint256 newShort) internal view {
+    /// @dev Closes are never skew-checked, so the book can already sit above `maxOISkew`. An open is
+    /// then allowed as long as it does not grow the skew, so minority-side orders can walk it back
+    /// under the cap (Zenith #42). Must run before `newLong`/`newShort` are written.
+    function _checkOICaps(RiskParams storage r, uint256 marketId, uint256 newLong, uint256 newShort)
+        internal view
+    {
         uint256 gross = newLong + newShort;
         uint256 skew  = newLong > newShort ? newLong - newShort : newShort - newLong;
         if (gross > r.maxOIGross) revert OIGrossCap();
-        if (skew  > r.maxOISkew)  revert OISkewCap();
+        if (skew  > r.maxOISkew) {
+            uint256 oldLong  = openInterestLong[marketId];
+            uint256 oldShort = openInterestShort[marketId];
+            uint256 oldSkew  = oldLong > oldShort ? oldLong - oldShort : oldShort - oldLong;
+            if (skew > oldSkew) revert OISkewCap();
+        }
     }
 
     function _toInt128Saturating(int256 x) internal pure returns (int128) {
