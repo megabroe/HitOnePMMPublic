@@ -509,9 +509,12 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         if (!pos.isLong) priceDiff = -priceDiff;
         pnl = priceDiff * int256(uint256(sizeUnits)) * int256(uint256(r.notionalScale));
 
-        // Own-side index (two-sided funding): positive delta means this side pays.
+        // Own-side index (two-sided funding): positive delta means this side pays. Rounded toward
+        // +inf so the fractional wei always favors the pool: a debt rounds up, a credit toward zero.
         int256 fundingDelta = int256(fundingNow) - int256(pos.fundingCheckpoint);
-        fundingPaid = (fundingDelta * int256(uint256(sizeUnits) * r.sizeTick)) / int256(ParamCatalog.SCALE);
+        int256 fundingNum = fundingDelta * int256(uint256(sizeUnits) * r.sizeTick);
+        fundingPaid = fundingNum / int256(ParamCatalog.SCALE);
+        if (fundingNum > 0 && fundingNum % int256(ParamCatalog.SCALE) != 0) fundingPaid += 1;
 
         int256 effPnl = pnl - fundingPaid;
         if (effPnl > 0) {
