@@ -34,6 +34,10 @@ abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
     /// truncates < 1 funding-index unit = < 1 USDM-wei per WHOLE token held, which is only
     /// material for micro-priced tokens held in enormous counts; this floor rules that regime out.
     uint256 internal constant MIN_PRICE_TICK = 1e12;
+    /// @dev How long a matured unstake request stays withdrawable. After `unlockAt + WITHDRAW_WINDOW`
+    /// the LP must re-request and serve the cooldown again, so an exit cannot be timed from a
+    /// request made long ago (#25).
+    uint256 internal constant WITHDRAW_WINDOW = 2 days;
 
     /// @dev MegaETH high-precision-timestamp system contract (µs since epoch).
     address internal constant HP_TIMESTAMP =

@@ -319,7 +319,8 @@ interface IH2Market {
     error UnbandedFeed();     // deposits require a banded primary feed (ring integrity)
     error InsufficientShares(); // unstake request exceeds shares held
     error NothingStaked();    // no pending unstake to withdraw
-    error CooldownActive();   // withdraw before the unstake cooldown elapsed
+    error CooldownActive();        // withdraw before the unstake cooldown elapsed
+    error UnstakeExpired();        // matured unstake request older than the withdraw window; re-request
     error NotFeedOperator();  // claimRake caller is not the primary feed's operator
     error ZeroAddress();
     error ZeroAmount();

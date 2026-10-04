@@ -69,7 +69,8 @@ abstract contract H2Treasury is H2Storage {
     }
 
     /// @notice Start the withdrawal cooldown on `shares` (they keep earning through it).
-    /// Re-requesting overwrites the prior request and resets the timer.
+    /// Re-requesting overwrites the prior request and resets the timer. Once matured, the request
+    /// is withdrawable for `WITHDRAW_WINDOW`, then expires.
     function requestUnstake(uint256 marketId, uint256 shares) external override {
         if (shares == 0) revert ZeroAmount();
         if (_shares[marketId][msg.sender] < shares) revert InsufficientShares();
@@ -93,6 +94,7 @@ abstract contract H2Treasury is H2Storage {
         Unstake memory u = _unstake[marketId][msg.sender];
         if (u.shares == 0) revert NothingStaked();
         if (block.timestamp < u.unlockAt) revert CooldownActive();
+        if (block.timestamp > u.unlockAt + WITHDRAW_WINDOW) revert UnstakeExpired();
 
         Vault storage v = _vault[marketId];
         uint256 held = _shares[marketId][msg.sender];
