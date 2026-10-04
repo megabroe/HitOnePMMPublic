@@ -255,9 +255,12 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         // erase its unrealized loss straight out of the pool.
         uint256 num      = uint256(pos.entryPrice) * oldSize + uint256(fillUnits) * uint256(addSizeUnits);
         uint256 newEntry = pos.isLong ? (num + newSize - 1) / newSize : num / newSize;
-        int256  newCheckpoint =
-            (int256(pos.fundingCheckpoint) * int256(oldSize) + int256(fundingNow) * int256(uint256(addSizeUnits)))
-            / int256(newSize);
+        // Blend the funding checkpoint, flooring toward −∞: a lower checkpoint means more funding
+        // owed, so the rounding error always lands on the trader, never on the pool.
+        int256  ckptNum =
+            int256(pos.fundingCheckpoint) * int256(oldSize) + int256(fundingNow) * int256(uint256(addSizeUnits));
+        int256  newCheckpoint = ckptNum / int256(newSize);
+        if (ckptNum < 0 && ckptNum % int256(newSize) != 0) newCheckpoint -= 1;
         if (newCol > type(uint128).max) revert BadSize();
 
         pos.entryPrice        = uint128(newEntry);
