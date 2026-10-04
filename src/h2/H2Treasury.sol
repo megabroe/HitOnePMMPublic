@@ -82,6 +82,13 @@ abstract contract H2Treasury is H2Storage {
         _shares[marketId][msg.sender] = held - burn;
         v.totalShares -= burn;
         v.poolAssets  -= uint128(assets);
+        // Last share gone and nothing open: sweep the rounding dust to the rake so the next first
+        // deposit starts from an empty pool (#26). With positions still open the remainder may be
+        // backing a trader's win, so it stays.
+        if (v.totalShares == 0 && v.poolAssets != 0
+            && openInterestLong[marketId] + openInterestShort[marketId] == 0) {
+            v.rakeOwed += v.poolAssets; v.poolAssets = 0;
+        }
         delete _unstake[marketId][msg.sender];
 
         emit Withdrawn(marketId, msg.sender, burn, assets);
@@ -158,7 +165,11 @@ abstract contract H2Treasury is H2Storage {
         Vault storage v = _vault[marketId];
         uint256 rake = amount * v.rakePpm / PPM;
         v.rakeOwed   += uint128(rake);
-        v.poolAssets += uint128(amount - rake);
+        // No shares outstanding ⇒ nobody owns the pool. Route the gain to the operator's rake
+        // instead of orphaning it behind the virtual share, so a first deposit always finds an
+        // empty pool and mints 1:1 (#26).
+        if (v.totalShares == 0) v.rakeOwed   += uint128(amount - rake);
+        else                    v.poolAssets += uint128(amount - rake);
     }
 
     /// @dev `_credit` for an ORDER-DRIVEN fee/cut, splitting the builder's share out of the
@@ -183,7 +194,8 @@ abstract contract H2Treasury is H2Storage {
                 emit BuilderFeeAccrued(marketId, builder, positionId, isOpenSide, bCut);
             }
         }
-        v.poolAssets += uint128(net);
+        if (v.totalShares == 0) v.rakeOwed   += uint128(net); // #26, as in _credit
+        else                    v.poolAssets += uint128(net);
     }
 
     /// @dev A user win leaves the pool. Reverts `Insolvent` when the pool cannot cover it
