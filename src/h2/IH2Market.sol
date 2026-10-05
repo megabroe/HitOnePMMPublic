@@ -311,7 +311,7 @@ interface IH2Market {
     error FallbackNotArmed();      // primary feed not stale enough
     error MarkTooStale();          // executeAtMark: primary mark older than the sentinel gap
     error SelfServiceDisabled();   // executeAtMark: market's staleSpreadK is 0
-    error OracleTooOld();          // fallback feed stale (or future-stamped)
+    error OracleTooOld();          // fallback feed stale (or stamped > 60 s ahead of block time)
     error OracleBadAnswer();
     error PrimaryNeverPushed();    // no mark exists (expiry/settlement refuse a zero mark)
 

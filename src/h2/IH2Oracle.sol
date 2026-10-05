@@ -103,7 +103,7 @@ interface IH2Oracle {
     error MarkSameSlot();     // two publications in one HP millisecond
     error RateCapExceeded();  // |rate| above the feed's frozen maxRatePerSec
     error RefStale();         // reference feed older than refMaxStale (push refused)
-    error RefBadAnswer();     // reference answer ≤ 0 or future-stamped
+    error RefBadAnswer();     // reference answer ≤ 0 or stamped > 60 s ahead of block time
     error MarkOutOfBand();    // |mark − ref| beyond refBandPpm
 
     // ============================================================
@@ -131,7 +131,7 @@ interface IH2Oracle {
     /// moves, so the per-block push carries only the price. Rules: mark is a nonzero
     /// multiple of the feed's tick; publications in the same HP millisecond revert; a gap
     /// over 4.095 s records a ring sentinel; banded feeds check the reference (fresh,
-    /// positive, not future-stamped, within band). Funding still accrues on every push.
+    /// positive, within 60 s of block time, within band). Funding still accrues on every push.
     function push(uint256 feedId, uint256 mark) external;
 
     /// @notice `push`, then synchronously invoke each callback with the mark committed —

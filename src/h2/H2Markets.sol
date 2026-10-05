@@ -203,7 +203,9 @@ abstract contract H2Markets is H2Storage {
 
     /// @dev The fallback feed's price (1e18) and freshness, per the market's params — never
     /// reverts. `ok == false` when the fallback is unavailable: it reverts, or answers
-    /// non-positive / future-stamped. Callers decide whether that is fatal.
+    /// non-positive or stamped more than 60 s ahead of block time (clock-skew tolerance: a
+    /// round therefore counts as fresh for up to `fallbackMaxAge` + 60 s). Callers decide
+    /// whether that is fatal.
     function _tryFallbackRead(OracleParams storage o)
         internal view returns (bool ok, uint256 price1e18, bool fresh)
     {

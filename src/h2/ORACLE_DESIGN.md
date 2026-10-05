@@ -151,8 +151,9 @@ the deep-failure tier: the primary ring
 is unusable, so trades price against an independent feed rather than a stale
 mark. If *both* oracles fail, positions are stuck until `maxPositionDuration`,
 at which point permissionless expiry settles them at the last primary mark.
-Timestamps from either feed are normalized by magnitude (µs / ms / s) and
-future-stamped feeds are rejected.
+Timestamps from either feed are normalized by magnitude (µs / ms / s). A
+timestamp more than 60 s ahead of block time is rejected; up to 60 s is tolerated as
+clock skew, so a round can count as fresh for up to its max age + 60 s.
 
 ### 2.4 The deviation gate
 
