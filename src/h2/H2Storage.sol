@@ -38,6 +38,8 @@ abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
     /// the LP must re-request and serve the cooldown again, so an exit cannot be timed from a
     /// request made long ago (#25).
     uint256 internal constant WITHDRAW_WINDOW = 2 days;
+    /// @dev Minimum LP unstake cooldown a market may be created with (#29).
+    uint256 internal constant MIN_UNSTAKE_SECS = 1 days;
 
     /// @dev MegaETH high-precision-timestamp system contract (µs since epoch).
     address internal constant HP_TIMESTAMP =

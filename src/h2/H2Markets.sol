@@ -66,7 +66,9 @@ abstract contract H2Markets is H2Storage {
         if (r.maxOIGross == 0) r.maxOIGross = type(uint128).max;
         if (r.maxOISkew == 0)  r.maxOISkew  = type(uint128).max;
         if (r.liqWidthPpm > 100_000) revert BadMarketParams(); // early-trigger width ≤ 10%
-        if (r.unstakeSecs > 30 days) revert BadMarketParams(); // 0 = no cooldown; ≤ 30 d
+        // 1 d ≤ cooldown ≤ 30 d: a zero or near-zero cooldown lets a depositor jump in ahead of a
+        // predictable credit and straight back out with no exposure (#29).
+        if (r.unstakeSecs < MIN_UNSTAKE_SECS || r.unstakeSecs > 30 days) revert BadMarketParams();
         // staleSpreadK is ppm per √ms; at the sentinel gap (√4095 ≈ 64) the bound below
         // keeps the max self-service spread ≤ ~20% (64 × 3125 ≈ 200_000 ppm). 0 disables
         // executeAtMark for the market.
