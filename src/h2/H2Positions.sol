@@ -341,13 +341,27 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         if (block.timestamp < pos.expiresAt) revert PositionDurationNotElapsed();
         uint256 marketId = pos.marketId;
         IH2Oracle.FeedView memory feed = _feed(marketId);
-        // Never settle at an uninitialized mark; and under dual oracle failure this stale
-        // mark IS the documented exit.
+        // Never settle at an uninitialized mark.
         if (feed.lastPushMs == 0) revert PrimaryNeverPushed();
-        uint128 markUnits = uint128(feed.mark / _risk[marketId].priceTick);
+        uint256 tick = _risk[marketId].priceTick;
+        uint128 markUnits = uint128(feed.mark / tick);
+        // Primary stale: settle at a fresh fallback, with the fallback CLOSE spread against the
+        // position — the fill an `executeAtFallback` close would get, so waiting for expiry is
+        // never cheaper, and a position opened at a fallback price is never settled against a
+        // primary mark that predates it. Only under dual oracle failure is the stale mark the exit.
+        if (_primaryStale(marketId, feed)) {
+            OracleParams storage o = _oracles[marketId];
+            (bool ok, uint256 fb, bool fresh) = _tryFallbackRead(o);
+            if (ok && fresh) {
+                uint256 spread = fb * uint256(o.fbCloseSpreadPpm) / PPM;
+                markUnits = _toPriceUnits(
+                    pos.isLong ? _floorToTick(fb - spread, tick) : _ceilToTick(fb + spread, tick), tick
+                );
+            }
+        }
         // Expiry is a forced event: no close fee, no order → no builder.
         uint256 payout_ = _settleClose(id, markUnits, feed, false, BuilderRef({ builder: address(0), feePpm: 0 }));
-        emit PositionExpired(id, _priceOut(markUnits, _risk[marketId].priceTick), payout_);
+        emit PositionExpired(id, _priceOut(markUnits, tick), payout_);
     }
 
     function _settleClose(

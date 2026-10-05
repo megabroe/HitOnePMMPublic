@@ -149,8 +149,10 @@ close and liquidate against the **fallback push feed** (Chainlink-shaped;
 RedStone Bolt on MegaETH) at its price ± the market's fallback spreads. This is
 the deep-failure tier: the primary ring
 is unusable, so trades price against an independent feed rather than a stale
-mark. If *both* oracles fail, positions are stuck until `maxPositionDuration`,
-at which point permissionless expiry settles them at the last primary mark.
+mark. Permissionless expiry follows the same tiers: a fresh primary mark, else
+a fresh fallback price with the fallback close spread against the position. If
+*both* oracles fail, positions are stuck until `maxPositionDuration`, at which
+point expiry settles them at the last primary mark.
 Timestamps from either feed are normalized by magnitude (µs / ms / s). A
 timestamp more than 60 s ahead of block time is rejected; up to 60 s is tolerated as
 clock skew, so a round can count as fresh for up to its max age + 60 s.
