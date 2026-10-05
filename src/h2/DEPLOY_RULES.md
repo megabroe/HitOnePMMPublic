@@ -7,6 +7,8 @@ are what a deployer must get right. Each one comes from the Zenith 2026-09 audit
    `maxDeviationPpm`, and the feed's `refFeed` must be the market's `fallbackFeed`. The oracle bands
    every mark before it enters the history, so nothing the market would refuse to trade on can
    later be used to liquidate a position. (Zenith #35)
+   Keep the band meaningful for the asset and `refMaxStale` finite and no longer than you would
+   trust the reference for: a 100% band or a never-stale reference turns the check off. (Zenith #44)
 
 2. **Seed every vault at creation and keep the seed until wind-down.** Deposit into the vault in
    the same run that creates the market, and leave that deposit in until the market has no open
@@ -24,5 +26,5 @@ are what a deployer must get right. Each one comes from the Zenith 2026-09 audit
    Otherwise a larger win can pay out less than a smaller one. (Zenith #30)
 
 Reference deployment (MegaETH mainnet, BTC): reference band 1% and deviation gate 1%, both against
-the same RedStone feed (8 decimals); vault seeded at creation; native-ETH builder stake; cut
+the same RedStone feed (8 decimals), reference max age 6 h; vault seeded at creation; native-ETH builder stake; cut
 intercept 10%, slope 10%, max 5.5%.
