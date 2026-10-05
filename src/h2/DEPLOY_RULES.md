@@ -47,6 +47,17 @@ are what a deployer must get right. Each one comes from the Zenith 2026-09 audit
    market can see; close notional is priced at the fill, so it grows with price well past
    `maxPositionNotional`. (Zenith #16)
 
+9. **Slippage inside the margin.** An open or increase is not checked against its own liquidation
+   threshold: `_openPosition` / `_increasePosition` only require the collateral to cover the fee, so
+   an order whose spread + fee reaches `1 / leverage − liqWidthPpm` is stored already liquidatable
+   and the next callback wipes it with the price unchanged. On the fallback path that is every open
+   from ≈ 950x up (open spread 2,000 ppm less the 1,000 ppm cushion, plus the 50 ppm fee, against
+   1,000 ppm of collateral at 1000x). The guard is the order's own band: `_checkBandWithFee` holds
+   the all-in fill (spread and fee) within `targetPrice ± maxSlippageBps`, so with `targetPrice` at
+   the current mark an order with `maxSlippageBps < 10_000 / leverage − liqWidthPpm / 100` cannot be
+   filled into a dead position. Order builders must set it that way; at 1000x that is under 10 bps,
+   which no fallback fill satisfies. (Zenith #20)
+
 Reference deployment (MegaETH mainnet, BTC): reference band 1% and deviation gate 1%, both against
 the same RedStone feed (8 decimals), reference max age 6 h; vault seeded at creation; native-ETH builder stake; cut
 intercept 10%, slope 10%, max 5.5%; 1000x with a 50 ppm flat open fee and zero width, so post-fee
