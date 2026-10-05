@@ -30,6 +30,10 @@ abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
     /// @dev The ring's sentinel gap in ms (MarkRing.GAP_MAX_UNITS × GAP_UNIT_MS = 4095 × 1).
     /// A mark older than this sits across a discontinuity the walk-back cannot replay.
     uint256 internal constant MARK_RING_GAP_MAX_MS = 4_095;
+    /// @dev Minimum market price tick (and so minimum mark), 1e18-scaled: $0.000001. Each push
+    /// truncates < 1 funding-index unit = < 1 USDM-wei per WHOLE token held, which is only
+    /// material for micro-priced tokens held in enormous counts; this floor rules that regime out.
+    uint256 internal constant MIN_PRICE_TICK = 1e12;
 
     /// @dev MegaETH high-precision-timestamp system contract (µs since epoch).
     address internal constant HP_TIMESTAMP =

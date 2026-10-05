@@ -90,6 +90,9 @@ abstract contract H2Markets is H2Storage {
         if (o.fallbackMaxAge == 0 || o.fallbackMaxAge > 1 hours) revert BadMarketParams();
         if (o.fbOpenSpreadPpm > 200_000 || o.fbCloseSpreadPpm > 200_000) revert BadMarketParams();
         if (o.fbLiqSpreadPpm > o.fbCloseSpreadPpm) revert BadMarketParams();
+        // Funding-index truncation (< 1 USDM-wei per whole token per push) is only material for
+        // micro-priced tokens; floor the tick — and so the minimum mark — at $0.000001 (#7).
+        if (r.priceTick < MIN_PRICE_TICK) revert BadMarketParams();
         if (o.maxDeviationPpm == 0 || o.maxDeviationPpm > 200_000) revert BadMarketParams();
         if (r.maxSpreadPpm > 200_000) revert BadMarketParams();
 
