@@ -102,6 +102,7 @@ interface IH2Oracle {
     error BadMark();          // zero, not a tick multiple, or overflows units
     error MarkSameSlot();     // two publications in one HP millisecond
     error RateCapExceeded();  // |rate| above the feed's frozen maxRatePerSec
+    error NetNegativeFunding(); // rateLong + rateShort < 0: the pool would pay a hedged book
     error RefStale();         // reference feed older than refMaxStale (push refused)
     error RefBadAnswer();     // reference answer ≤ 0 or future-stamped
     error MarkOutOfBand();    // |mark − ref| beyond refBandPpm
