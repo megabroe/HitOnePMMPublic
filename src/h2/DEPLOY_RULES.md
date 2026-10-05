@@ -25,6 +25,17 @@ are what a deployer must get right. Each one comes from the Zenith 2026-09 audit
 5. **Monotonic winnings cut.** `cutSlopePpm × cutInterceptPpm ≤ 1e6 × (1e6 − 2 × maxCutPpm)`.
    Otherwise a larger win can pay out less than a smaller one. (Zenith #30)
 
+6. **Funding budget against post-fee collateral.** `createMarket` bounds the funding that can accrue
+   over `primaryStaleSecs` (the window in which a user cannot exit without the operator) against
+   gross collateral, `1 / maxLeverage`. The open fee is taken from that collateral first and
+   liquidation fires at `liqWidthPpm`, so hold the stricter bound by hand:
+   `fundingRateCapPerSec × primaryStaleSecs / PCT_SCALE ≤ 1 / maxLeverage − open fee at maxPositionNotional − liqWidthPpm`.
+   Keep `minAdjustGapBlocks` at 1; a longer gap extends the window in which a position cannot be
+   closed. Otherwise funding at the cap can liquidate a max-leverage position before the fallback
+   arms, with the price flat. (Zenith #12)
+
 Reference deployment (MegaETH mainnet, BTC): reference band 1% and deviation gate 1%, both against
 the same RedStone feed (8 decimals), reference max age 6 h; vault seeded at creation; native-ETH builder stake; cut
-intercept 10%, slope 10%, max 5.5%.
+intercept 10%, slope 10%, max 5.5%; 1000x with a 50 ppm flat open fee and zero width, so post-fee
+collateral is 950 ppm of notional against at most ≈ 488 ppm of funding over the 300 s window
+(rate cap 1.5e15 per second); adjustment gap 1 block.
