@@ -33,6 +33,7 @@ contract BuilderRegistry is IBuilderRegistry, ReentrancyGuard {
     error ZeroStake();
     error BadValue();
     error NativeTransferFailed();
+    error ZeroRecipient();
 
     constructor(address stakeToken_, uint256 minStake_) {
         if (minStake_ == 0) revert StakeTooLow();
@@ -57,18 +58,26 @@ contract BuilderRegistry is IBuilderRegistry, ReentrancyGuard {
         emit BuilderRegistered(msg.sender, s);
     }
 
-    /// @notice Withdraw the full stake and deregister (no cooldown). Accrued builder fees live in
-    /// the market and are claimed there — unaffected by this.
-    function unregister() external nonReentrant {
+    /// @notice Withdraw the full stake to the caller and deregister (no cooldown). Accrued
+    /// builder fees live in the market and are claimed there — unaffected by this.
+    function unregister() external {
+        unregisterTo(payable(msg.sender));
+    }
+
+    /// @notice Withdraw the caller's full stake to `to` and deregister. Lets a contract builder
+    /// that cannot receive plain ETH route its stake elsewhere; the stake is always debited from
+    /// `msg.sender`, so only a builder can move its own stake.
+    function unregisterTo(address payable to) public nonReentrant {
+        if (to == address(0)) revert ZeroRecipient();
         uint256 s = stakeOf[msg.sender];
         if (s == 0) revert ZeroStake();
         stakeOf[msg.sender] = 0; // effects before interaction
         emit BuilderUnregistered(msg.sender, s);
         if (stakeToken == address(0)) {
-            (bool ok, ) = payable(msg.sender).call{ value: s }("");
+            (bool ok, ) = to.call{ value: s }("");
             if (!ok) revert NativeTransferFailed();
         } else {
-            IERC20(stakeToken).safeTransfer(msg.sender, s);
+            IERC20(stakeToken).safeTransfer(to, s);
         }
     }
 
