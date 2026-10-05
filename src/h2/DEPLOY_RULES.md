@@ -40,9 +40,17 @@ are what a deployer must get right. Each one comes from the Zenith 2026-09 audit
    fallback price. With the width inside the gap between the two spreads, such a close pays out
    nothing, the same as the wipe. A wider width would let it recover residual equity. (Zenith #14)
 
+8. **Flat fee curves.** Keep the size-scaling fee terms (`openLinearScale`, `openQuadScale`,
+   `closeLinearScale`, `closeQuadScale`) at 0. `createMarket` bounds each coefficient but not the
+   curve's value, and a close-fee rate above 100% makes a long close of that size revert. If a term
+   is ever enabled, the curve must stay at or below `MAX_FEE_PPM` (10%) at any close notional the
+   market can see; close notional is priced at the fill, so it grows with price well past
+   `maxPositionNotional`. (Zenith #16)
+
 Reference deployment (MegaETH mainnet, BTC): reference band 1% and deviation gate 1%, both against
 the same RedStone feed (8 decimals), reference max age 6 h; vault seeded at creation; native-ETH builder stake; cut
 intercept 10%, slope 10%, max 5.5%; 1000x with a 50 ppm flat open fee and zero width, so post-fee
 collateral is 950 ppm of notional against at most ≈ 488 ppm of funding over the 300 s window
 (rate cap 1.5e15 per second); adjustment gap 1 block; fallback close spread 2,000 ppm and liquidation
-cushion 1,000 ppm, so the zero width sits 1,000 ppm inside rule 7.
+cushion 1,000 ppm, so the zero width sits 1,000 ppm inside rule 7; flat 50 ppm open and close fees
+with every size-scaling term at 0.
