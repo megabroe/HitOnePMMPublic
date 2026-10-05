@@ -279,6 +279,7 @@ interface IH2Market {
     error UnknownMarket();
     error NotOracle();         // onMark caller is not the H2Oracle
     error FeedMismatch();      // callback feed is not the market's primary feed
+    error BadActionKind(uint8 kind); // onMark payload names an unknown action kind
 
     error BadLeverage();
     error BadSize();

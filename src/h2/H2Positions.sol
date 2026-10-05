@@ -55,9 +55,13 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
             // (per side/action), capped by the market's bound.
             uint256 spreadPpm = _derivedSpread(marketId, feed, order.isOpen, order.isLong);
             _routeOrder(order, _adverseFill(order, feed.mark, spreadPpm, _risk[marketId].priceTick), feed);
-        } else {
+        } else if (kind == uint8(ActionKind.Liquidate)) {
             uint256[] memory ids = abi.decode(payload, (uint256[]));
             _liquidateBatch(marketId, feed, ids);
+        } else {
+            // Explicit allowlist of kinds: a malformed or version-skewed payload must fail, never
+            // fall through into a state-changing action.
+            revert BadActionKind(kind);
         }
     }
 
