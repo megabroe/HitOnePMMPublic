@@ -34,6 +34,18 @@ abstract contract H2Treasury is H2Storage {
     function deposit(uint256 marketId, uint256 assets)
         external override nonReentrant returns (uint256 shares)
     {
+        return _deposit(marketId, assets, 0);
+    }
+
+    /// @notice `deposit` with a slippage bound: reverts `SlippageExceeded` if fewer than `minShares`
+    /// would be minted (the share price can move between quoting and inclusion).
+    function deposit(uint256 marketId, uint256 assets, uint256 minShares)
+        external override nonReentrant returns (uint256 shares)
+    {
+        return _deposit(marketId, assets, minShares);
+    }
+
+    function _deposit(uint256 marketId, uint256 assets, uint256 minShares) internal returns (uint256 shares) {
         if (_creatorOf[marketId] == address(0)) revert UnknownMarket();
         if (assets == 0) revert ZeroAmount();
         if (assets > type(uint128).max) revert BadSize();
@@ -46,6 +58,7 @@ abstract contract H2Treasury is H2Storage {
         // Mint at NAV with a virtual offset: shares = assets · (totalShares+1)/(poolAssets+1).
         shares = Math.mulDiv(assets, v.totalShares + 1, uint256(v.poolAssets) + 1);
         if (shares == 0) revert ZeroAmount();
+        if (shares < minShares) revert SlippageExceeded();
 
         usdm.safeTransferFrom(msg.sender, address(this), assets);
         v.poolAssets    += uint128(assets);
@@ -67,6 +80,16 @@ abstract contract H2Treasury is H2Storage {
 
     /// @notice Withdraw a matured unstake: burn the requested shares at the current NAV.
     function withdraw(uint256 marketId) external override nonReentrant returns (uint256 assets) {
+        return _withdraw(marketId, 0);
+    }
+
+    /// @notice `withdraw` with a slippage bound: reverts `SlippageExceeded` before burning anything
+    /// if the redemption would pay less than `minAssets`.
+    function withdraw(uint256 marketId, uint256 minAssets) external override nonReentrant returns (uint256 assets) {
+        return _withdraw(marketId, minAssets);
+    }
+
+    function _withdraw(uint256 marketId, uint256 minAssets) internal returns (uint256 assets) {
         Unstake memory u = _unstake[marketId][msg.sender];
         if (u.shares == 0) revert NothingStaked();
         if (block.timestamp < u.unlockAt) revert CooldownActive();
@@ -78,6 +101,7 @@ abstract contract H2Treasury is H2Storage {
         // Redeem at NAV with the virtual offset: assets = burn · (poolAssets+1)/(totalShares+1).
         // Floored, so assets ≤ poolAssets always (the offset keeps the vault solvent).
         assets = Math.mulDiv(burn, uint256(v.poolAssets) + 1, v.totalShares + 1);
+        if (assets < minAssets) revert SlippageExceeded();
 
         _shares[marketId][msg.sender] = held - burn;
         v.totalShares -= burn;

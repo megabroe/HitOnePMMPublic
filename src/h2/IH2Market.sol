@@ -420,6 +420,8 @@ interface IH2Market {
     /// trading P&L (after the feed's rake) flows to share price. Permissionless and
     /// immediate. Requires a banded primary feed (`UnbandedFeed`) for ring integrity.
     function deposit(uint256 marketId, uint256 assets) external returns (uint256 shares);
+    /// @notice `deposit` that reverts `SlippageExceeded` if fewer than `minShares` would be minted.
+    function deposit(uint256 marketId, uint256 assets, uint256 minShares) external returns (uint256 shares);
 
     /// @notice Begin the withdrawal cooldown on `shares`. They STAY in the pool and keep
     /// earning + bearing P&L until `withdraw`; the cooldown (`unstakeSecs`) is exit friction
@@ -429,6 +431,8 @@ interface IH2Market {
     /// @notice Withdraw a matured unstake: burns the requested shares at the CURRENT NAV and
     /// pays out. Reverts `NothingStaked` / `CooldownActive`.
     function withdraw(uint256 marketId) external returns (uint256 assets);
+    /// @notice `withdraw` that reverts `SlippageExceeded`, before burning, if it would pay less than `minAssets`.
+    function withdraw(uint256 marketId, uint256 minAssets) external returns (uint256 assets);
 
     /// @notice Claim the market's accrued rake. Only the primary feed's operator; `to`
     /// receives the full `rakeOwed`.
