@@ -196,17 +196,32 @@ abstract contract H2Markets is H2Storage {
         );
     }
 
-    /// @dev The fallback feed's price (1e18) and freshness, per the market's params.
-    /// Rejects non-positive and future-stamped answers outright.
+    /// @dev The fallback feed's price (1e18) and freshness, per the market's params — never
+    /// reverts. `ok == false` when the fallback is unavailable: it reverts, or answers
+    /// non-positive / future-stamped. Callers decide whether that is fatal.
+    function _tryFallbackRead(OracleParams storage o)
+        internal view returns (bool ok, uint256 price1e18, bool fresh)
+    {
+        try IAggregatorV3(o.fallbackFeed).latestRoundData()
+            returns (uint80, int256 answer, uint256, uint256 updatedAt, uint80)
+        {
+            uint256 upd = _updatedAtSecs(updatedAt);
+            if (answer <= 0 || upd > block.timestamp + 60) return (false, 0, false);
+            return (true, uint256(answer) * (10 ** (18 - uint256(o.fallbackDecimals))),
+                    block.timestamp <= upd + uint256(o.fallbackMaxAge));
+        } catch {
+            return (false, 0, false);
+        }
+    }
+
+    /// @dev Mandatory fallback read (fallback-mode execution and liquidation): an unavailable
+    /// fallback reverts `OracleBadAnswer`.
     function _fallbackRead(OracleParams storage o)
         internal view returns (uint256 price1e18, bool fresh)
     {
-        (, int256 answer,, uint256 updatedAt,) = IAggregatorV3(o.fallbackFeed).latestRoundData();
-        if (answer <= 0) revert OracleBadAnswer();
-        uint256 upd = _updatedAtSecs(updatedAt);
-        if (upd > block.timestamp + 60) revert OracleBadAnswer(); // future-stamped
-        price1e18 = uint256(answer) * (10 ** (18 - uint256(o.fallbackDecimals)));
-        fresh = block.timestamp <= upd + uint256(o.fallbackMaxAge);
+        bool ok;
+        (ok, price1e18, fresh) = _tryFallbackRead(o);
+        if (!ok) revert OracleBadAnswer();
     }
 
     /// @dev THE CONVERGENCE CHECK: require the primary mark and the fallback to agree
@@ -215,7 +230,7 @@ abstract contract H2Markets is H2Storage {
     /// markets exist), so the ring stays alive through a gated window and the walk-back can
     /// catch in-window crossings once the gate lifts.
     ///
-    /// The two callers differ only in how they treat a STALE fallback:
+    /// The two callers differ only in how they treat a STALE or UNAVAILABLE fallback:
     ///  - `requireFallback == false` (operator-attached `onMark`, authoritative fresh mark):
     ///    a stale fallback is simply no anchor to disagree with, so the check passes.
     ///  - `requireFallback == true` (self-service against a STALE mark): the mark is only
@@ -224,7 +239,11 @@ abstract contract H2Markets is H2Storage {
         internal view
     {
         OracleParams storage o = _oracles[marketId];
-        (uint256 fb, bool fresh) = _fallbackRead(o);
+        (bool ok, uint256 fb, bool fresh) = _tryFallbackRead(o);
+        if (!ok) {
+            if (requireFallback) revert OracleBadAnswer();
+            return; // an optional anchor that cannot answer is no anchor to disagree with (#2)
+        }
         if (!fresh) {
             if (requireFallback) revert OracleTooOld();
             return;
