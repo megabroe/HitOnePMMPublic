@@ -160,9 +160,17 @@ clock skew, so a round can count as fresh for up to its max age + 60 s.
 Whenever both a primary price (a fresh mark, or the stale mark a self-service
 trade would use) and a fresh fallback exist, every position action requires
 `|primary − fallback| ≤ maxDeviationPpm`. A discrepancy blocks opens, closes
-and liquidations — but **not publications**: marks keep recording through a
-gated window so the ring stays alive, and the walk-back can catch in-window
-liquidation crossings once the gate lifts.
+and liquidations — but **not publications**: the oracle does not know markets
+exist, so a market's gate never stops a mark from being recorded, and the
+walk-back can catch in-window liquidation crossings once the gate lifts.
+
+Publication has its own, separate check. On a banded feed every push must sit
+within `refBandPpm` of a reference answer no older than `refMaxStale`
+(`H2Oracle._checkReferenceBand`); a stale, invalid or out-of-band reference
+reverts the push. So history keeps recording through a *market's* gated window
+only while the feed's reference check passes. If it does not, publication
+stops, and once the gap exceeds 4.095 s the next mark is recorded behind a
+sentinel that the walk-back cannot cross.
 
 The gate is symmetric: it protects users from a hostile primary and the
 treasury from a wedged fallback, turning "the two price sources disagree" into
@@ -170,17 +178,25 @@ a halt rather than a choice.
 
 ## 3. The exchange as market maker
 
-A market's economics are entirely frozen parameters, grouped into three
+A market's economics are entirely frozen parameters, grouped into four
 sub-structs (each ≤ 24 fields, so standard tooling can bind them):
 
 - **`FeeParams`** — opening fee curve (flat + linear + quadratic ppm of
-  notional), closing fee curve (same shape), winnings-cut ramp (min, max,
-  scale ppm on percent return).
+  notional), closing fee curve (same shape), winnings-cut ramp
+  (`cutInterceptPpm`, `cutSlopePpm`, `maxCutPpm`, on percent return), and
+  `maxBuilderFeePpm` (the cap on a per-order builder's share).
 - **`RiskParams`** — `priceTick`/`sizeTick`, min/max leverage,
   `maxPositionNotional`, `maxOIGross`/`maxOISkew`, `maxPositionDuration`,
-  `liqWidthPpm`, `maxFundingRatePerSec`, `maxSpreadPpm`, `termSecs`, and
-  (DESIGN, §2.2) `staleSpreadK` — the self-service staleness-spread coefficient
-  (ppm per √millisecond, ≈ 2σ; 0 disables self-service).
+  `liqWidthPpm`, `fundingRateCapPerSec`, `maxSpreadPpm`, `unstakeSecs` (the
+  share vault's withdrawal cooldown, 1–30 d; §4), `staleSpreadK` (§2.2: the
+  self-service staleness-spread coefficient, ppm per √millisecond, ≈ 2σ; 0
+  disables self-service), and `minAdjustGapBlocks` (the minimum number of
+  blocks between two adjustments to one position, 1–1,000,000: it stops an increase
+  or close from being chunked within a block to dodge the convex size-fee
+  curve, and bounds basis dilution of the winnings cut).
+- **`SpreadParams`** — `openVolK`/`openSkewK`/`closeVolK`/`closeSkewK`, the
+  coefficients that turn the feed's published `vol`/`skew` into the derived
+  spread for each side and action (§1), clamped to `maxSpreadPpm`.
 - **`OracleParams`** — primary `feedId`, fallback feed + decimals,
   `primaryStaleSecs`, `fallbackMaxAge`, fallback open/close/liquidation
   spreads (ppm), `maxDeviationPpm`.
@@ -194,8 +210,9 @@ With those, the contract quotes:
   age-dependent `staleSpread` term (§2.2) is zero on the operator-attached path
   and grows on self-service.
 - **Funding**: accrued from the feed's two-sided indices, checkpointed per
-  position, settled at close, with the market enforcing `|rate| ≤
-  maxFundingRatePerSec` at consumption.
+  position, settled at close. Rates are bounded by the feed's frozen
+  `maxRatePerSec`, enforced at push; a market can only be created on a feed
+  whose cap is within its own `fundingRateCapPerSec`.
 - **Liquidation**: a position is liquidatable when the oracle price is within
   `liqWidthPpm` of its liquidation price — an early trigger, so the full
   knockout (all collateral to the treasury) lands *before* bankruptcy and the
@@ -217,64 +234,58 @@ the exchange does **not** impose a fee-floor tying `openFlat`/`closeFlat` to
 everything else buys nothing. The deviation gate (§2.4) remains, as a
 staleness/sanity check against a *stale or diverged* fallback — not as protection
 against the operator itself. The remaining creation-time bounds carry over: band and
-spread caps, `termSecs ∈ [1 h, 365 d]`, and the coupled funding ceiling
-(`maxFundingRatePerSec × primaryStaleSecs × maxLeverage ≤ ½·PCT_SCALE` — the
+spread caps, `maxPositionDuration ∈ [1 h, 365 d]`, `unstakeSecs ∈ [1 d, 30 d]`, and the
+coupled funding ceiling
+(`fundingRateCapPerSec × primaryStaleSecs × maxLeverage ≤ ½·PCT_SCALE` — the
 funding accrued during the window users cannot exit without the operator can
 never eat more than half of worst-case collateral).
 
-## 4. Treasury — index lending (full spec in TREASURY_DESIGN.md)
+## 4. Treasury — permissionless share vault (full spec in TREASURY_DESIGN.md)
 
-One lending pool per market. `poolAssets` holds lender principal plus retained
-trading P&L; there is no junior tranche and no creator-posted capital. The
-**creator** (typically the same party as the feed operator, but the roles are
-distinct — the operator publishes prices, the creator owns the money) has two
-powers: `setRate(marketId, ratePpm)` and `withdrawSurplus`. Everything else is
-frozen.
+One share vault per market. Lenders deposit USDM and receive shares; all of the
+book's trading P&L — open/close fees, the winnings cut, trader losses and
+liquidation wipes, minus trader wins — flows through `poolAssets`, so the share
+price rises and falls with the book. The lenders are the counterparty to every
+trade; there is no junior tranche and no creator-posted capital.
 
-**Lenders** call `depositFund`, which requires a nonzero rate (0 = deposits
-closed, the creator's off switch) and a **banded primary feed** (`UnbandedFeed`
-otherwise): senior money requires ring integrity, since an unbanded operator
+There is **no rate, no term and no creator role**. `createMarket` records
+`msg.sender` as the creator for identity only: nobody can set a rate, withdraw
+a surplus, or change anything after creation. The one carve-out is the **oracle
+rake** — the feed operator's frozen `feeRakePpm` share of every pool gain,
+which the operator claims with `claimRake`.
+
+**Lenders** call `deposit(marketId, assets)`, which mints shares at the vault's
+current share price and requires a **banded primary feed** (`UnbandedFeed`
+otherwise): lender money requires ring integrity, since an unbanded operator
 could fabricate history and drain the pool through one fake round trip or a
-retroactive walk-back wipe. Principal earns a fixed rate accrued through a
-single continuous per-market index (`fundingIndex`), so no deposit is ever
-individually rolled — one `_accrue` advances every deposit's interest at once.
-A deposit records `principal` and `entryIndex`; its interest is `principal ·
-(index − entryIndex)`.
+retroactive walk-back wipe. A deposit is not an interest-bearing principal
+balance: 1,000 USDM buys shares whose value then moves with the pool, up or
+down.
 
-Terms are **fixed global expiries** every `termSecs`, shared by all deposits
-and governing withdrawal only. Auto-roll is the default (a deposit simply keeps
-earning through the index across each boundary). To exit, a lender calls
-`stopRoll`, which freezes its interest at the index the deposit will hold at the
-**next boundary** (`frozenIndex`); once the live index reaches that value the
-principal + frozen interest is withdrawable via `withdrawFund`, at any time
-after, with nothing to crank. A rate change while lenders are present applies at
-the next boundary (the running term keeps its rate); with none present it
-applies immediately.
+Exit is `requestUnstake(marketId, shares)` and then, once the market's frozen
+`unstakeSecs` cooldown has passed, `withdraw(marketId)`. The shares stay in the
+pool through the cooldown, earning and bearing P&L, and redeem at the share
+price current at withdrawal. There are no shared term boundaries and nothing to
+crank.
 
-Settlement collapses to plain pool moves: `_credit` adds trading earnings
-(open/close fees, user losses, liquidation wipes, the winnings cut) to
+Settlement is plain pool moves: `_credit` adds trading earnings (after the
+rake, and after any builder share of an order-driven fee or cut) to
 `poolAssets`; `_drainPool` pays user winnings from it and reverts `Insolvent`
-past what the pool — lender principal included — can cover. The creator may
-withdraw `poolAssets − lenderObligation` (where `lenderObligation =
-totalPrincipal + accInterest + frozenOwed`) as surplus, never lender-owed
-capital.
+past what the pool can cover. A loss is a markdown borne pro-rata by every
+share; there is no haircut mechanism.
 
-The risk this accepts, stated plainly to lenders: the creator holds no buffer
-and withdraws all surplus, so lenders sit directly on the book. A book that
-loses more than it has earned haircuts withdrawing principal pro-rata (`pay =
-owed · poolAssets / obligation`); the fixed rate is an accrual, not a guarantee,
-worth what the pool backs it for. **There is no solvency check on open** — the
-onus is on the opener to compare `grossOpenNotional(marketId)` against
-`treasuryOf(marketId)` (two cheap reads); insolvency bites only at payout
-(`Insolvent`, first-come-first-served — a win that cannot be covered leaves the
-position open until the pool is replenished) and at lender withdrawal (the
-haircut ratio).
+The risk this accepts, stated plainly to lenders: they sit directly on the
+book, unhedged. **There is no solvency check on open** — the onus is on the
+opener to compare `grossOpenNotional(marketId)` against
+`vaultOf(marketId).poolAssets` (two cheap reads); insolvency bites only at
+payout (`Insolvent`, first-come-first-served — a win that cannot be covered
+leaves the position open until the pool can cover it).
 
 ## 5. Order lifecycle
 
-1. User signs an EIP-712 `Order` (11 fields, naming the `marketId`;
-   domain `H2Market`/`1`) with target price and slippage bound, and sends it
-   to the feed operator off-chain.
+1. User signs an EIP-712 `Order` (13 fields, naming the `marketId`;
+   domain `H2Market`/`1`; exact struct below) with target price and slippage
+   bound, and sends it to the feed operator off-chain.
 2. The operator attaches it (with any others, and any liquidation batch) to
    its next `pushAndCall`.
 3. The oracle records the mark and invokes the exchange's `onMark`; the
@@ -288,6 +299,32 @@ haircut ratio).
 5. `cancelNonce` retires an unspent order at any time; a cancel racing an
    in-flight commit reverts the commit's execution of that order —
    a normal outcome, not an anomaly.
+
+The signed struct has 13 fields. All of them are hashed, in this order,
+including `builder` and `builderFeePpm` when both are zero (an order with no
+builder):
+
+| # | Type | Field | Notes |
+|---|---|---|---|
+| 1 | `address` | `user` | the signer |
+| 2 | `uint256` | `marketId` | pins both oracles and every frozen parameter |
+| 3 | `bool` | `isLong` | |
+| 4 | `bool` | `isOpen` | true = open/increase, false = close/decrease |
+| 5 | `uint256` | `size` | 1e18 asset-wei |
+| 6 | `uint256` | `leverage` | ignored on close |
+| 7 | `uint256` | `targetPrice` | 1e18 USDM-wei |
+| 8 | `uint256` | `maxSlippageBps` | worst acceptable deviation from `targetPrice` |
+| 9 | `uint64` | `deadline` | unix seconds |
+| 10 | `uint256` | `channel` | `(channel, nonce)` is single-use per user |
+| 11 | `uint256` | `nonce` | |
+| 12 | `address` | `builder` | 0 = no builder |
+| 13 | `uint256` | `builderFeePpm` | must be 0 when `builder` is 0; ≤ the market's `maxBuilderFeePpm` |
+
+The EIP-712 type string (one line, no spaces after the commas):
+
+```
+Order(address user,uint256 marketId,bool isLong,bool isOpen,uint256 size,uint256 leverage,uint256 targetPrice,uint256 maxSlippageBps,uint64 deadline,uint256 channel,uint256 nonce,address builder,uint256 builderFeePpm)
+```
 
 The signing domain is `name="H2Market", version="1"`, with `verifyingContract`
 the exchange address. That address moves on any redeploy while the domain

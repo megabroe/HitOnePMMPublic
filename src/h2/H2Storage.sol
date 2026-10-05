@@ -226,13 +226,13 @@ abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
     // ---- tick helpers ----
 
     function _toPriceUnits(uint256 input, uint256 priceTick) internal pure returns (uint128) {
-        if (input == 0 || input % priceTick != 0) revert BadMark();
+        if (priceTick == 0 || input == 0 || input % priceTick != 0) revert BadMark();
         uint256 pu = input / priceTick;
         if (pu >= UNITS_CAP) revert BadMark();
         return uint128(pu);
     }
     function _toSizeUnits(uint256 input, uint256 sizeTick) internal pure returns (uint128) {
-        if (input == 0 || input % sizeTick != 0) revert BadSize();
+        if (sizeTick == 0 || input == 0 || input % sizeTick != 0) revert BadSize();
         uint256 su = input / sizeTick;
         if (su >= UNITS_CAP) revert BadSize();
         return uint128(su);

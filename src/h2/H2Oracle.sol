@@ -10,6 +10,7 @@ import { IAggregatorV3 } from "../common/IAggregatorV3.sol";
 import { IHighPrecisionTimestamp } from "../common/IHighPrecisionTimestamp.sol";
 import { MarkRing }     from "../common/MarkRing.sol";
 import { FundingIndex } from "../common/FundingIndex.sol";
+import { ParamCatalog } from "../common/ParamCatalog.sol";
 
 /// @title H2Oracle
 /// @notice See IH2Oracle. Standalone, ownerless, immutable. Holds no funds and knows
@@ -77,7 +78,7 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
         if (priceTick == 0 || priceTick > type(uint128).max) revert BadFeedParams();
         if (maxRatePerSec == 0 || maxRatePerSec > uint64(uint256(int256(type(int64).max))))
             revert BadFeedParams();
-        if (feeRakePpm > 500_000) revert BadFeedParams(); // rake ≤ 50%
+        if (feeRakePpm > ParamCatalog.MAX_FEE_RAKE_PPM) revert BadFeedParams();
         if (refFeed != address(0)) {
             // A banded feed's guarantee must be meaningful: nonzero band ≤ 100%, bounded
             // staleness, decodable decimals.
@@ -277,6 +278,10 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
 
     function ringEntry(uint256 feedId, uint256 idx) external view override returns (uint32) {
         if (_feeds[feedId].operator == address(0)) revert UnknownFeed();
+        // Only the retained window [head − RING_LEN, head) is readable: the ring wraps modulo
+        // RING_LEN, so an index outside it would alias an unwritten or newer slot.
+        uint256 head = uint256(_feeds[feedId].ringHead);
+        if (idx >= head || head - idx > MarkRing.RING_LEN) revert RingEntryOutOfRange();
         return MarkRing.readMarkEntry(_rings[feedId], idx);
     }
 

@@ -25,6 +25,9 @@ library ParamCatalog {
     uint256 internal constant MAX_FEE_BPS          = 1_000;    // open-fee cap for bps-denominated venues
     uint256 internal constant MAX_FEE_PPM          = 100_000;  // 10% — open-fee cap for ppm-denominated venues
     uint256 internal constant MAX_HOUSE_CUT_PPM    = 500_000;  // 50% ceiling on the cut rate
+    uint256 internal constant MAX_BUILDER_FEE_PPM  = 500_000;  // 50% — cap on a builder's share of an order's fees/cut
+    uint256 internal constant MAX_LIQ_WIDTH_PPM    = 100_000;  // 10% — cap on the early-trigger liquidation width
+    uint256 internal constant MAX_FEE_RAKE_PPM     = 500_000;  // 50% — cap on the feed operator's rake of pool gains
     uint256 internal constant MIN_LEVERAGE_FLOOR   = 1;
     uint256 internal constant MAX_LEVERAGE_CEIL    = 10_000;
     uint256 internal constant MIN_DURATION_FLOOR   = 1 hours;

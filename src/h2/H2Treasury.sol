@@ -170,6 +170,7 @@ abstract contract H2Treasury is H2Storage {
     }
 
     function grossOpenNotional(uint256 marketId) external view override returns (uint256) {
+        if (_creatorOf[marketId] == address(0)) revert UnknownMarket();
         return openInterestLong[marketId] + openInterestShort[marketId];
     }
 
@@ -191,8 +192,9 @@ abstract contract H2Treasury is H2Storage {
     /// VAULT RESIDUAL: the oracle rake is skimmed FIRST (senior, untouched by the builder), then
     /// an ELIGIBLE builder takes `builderFeePpm` of what remains, and only the rest lifts share
     /// price. Eligibility is the per-market registry's call (`_builderEligible`); an ineligible/
-    /// zero builder simply forfeits the share to the vault. Used for open fees, close fees, and
-    /// the winnings cut (open crystallization + close/decrease).
+    /// zero builder simply forfeits the share to the vault. Used for open fees (open and
+    /// increase), close fees, and the winnings cut (close/decrease only — an increase realizes
+    /// no cut).
     function _creditWithBuilder(
         uint256 marketId, uint256 amount, address builder, uint256 builderFeePpm,
         uint256 positionId, bool isOpenSide

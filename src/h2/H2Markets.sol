@@ -36,7 +36,7 @@ abstract contract H2Markets is H2Storage {
         if (f.openLinearScale  > PPM || f.openQuadScale  > PPM ||
             f.closeLinearScale > PPM || f.closeQuadScale > PPM) revert BadMarketParams();
         if (f.maxCutPpm > ParamCatalog.MAX_HOUSE_CUT_PPM) revert BadMarketParams();
-        if (f.maxBuilderFeePpm > 500_000) revert BadMarketParams(); // builder share cap ≤ 50%
+        if (f.maxBuilderFeePpm > ParamCatalog.MAX_BUILDER_FEE_PPM) revert BadMarketParams();
 
         // ---- spread parameterization (vol/skew → derived spread) ----
         // Bound the coefficients so the derived-spread intermediate can't be absurd; the
@@ -65,7 +65,7 @@ abstract contract H2Markets is H2Storage {
         if (r.maxPositionNotional == 0) revert BadMarketParams(); // opens have no solvency gate
         if (r.maxOIGross == 0) r.maxOIGross = type(uint128).max;
         if (r.maxOISkew == 0)  r.maxOISkew  = type(uint128).max;
-        if (r.liqWidthPpm > 100_000) revert BadMarketParams(); // early-trigger width ≤ 10%
+        if (r.liqWidthPpm > ParamCatalog.MAX_LIQ_WIDTH_PPM) revert BadMarketParams();
         // 1 d ≤ cooldown ≤ 30 d: a zero or near-zero cooldown lets a depositor jump in ahead of a
         // predictable credit and straight back out with no exposure (#29).
         if (r.unstakeSecs < MIN_UNSTAKE_SECS || r.unstakeSecs > 30 days) revert BadMarketParams();
