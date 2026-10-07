@@ -23,8 +23,8 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 /// gate blocks any action if the two price sources disagree.
 ///
 /// **Markets are frozen.** `createMarket` fixes every parameter forever; changing anything
-/// means a new market. The per-market treasury (index lending: pooled lender capital that
-/// backs the book and earns a fixed rate) is specified in TREASURY_DESIGN.md.
+/// means a new market. The per-market treasury (a permissionless share vault: pooled lender
+/// capital that backs the book and takes its P&L) is specified in TREASURY_DESIGN.md.
 
 interface IH2Market {
     // ============================================================
@@ -58,8 +58,8 @@ interface IH2Market {
     struct SpreadParams {
         uint32 openVolK;   // ≤ 1e9; ppm of open spread at 1% vol
         uint32 openSkewK;  // ≤ 1e9; ppm of open spread per 1% skew (asymmetry)
-        uint32 closeVolK;  // ≤ 1e9; 0 ⇒ zero close spread
-        uint32 closeSkewK; // ≤ 1e9
+        uint32 closeVolK;  // ≤ 1e9; 0 disables the close volatility term
+        uint32 closeSkewK; // ≤ 1e9; 0 disables the close skew term (both 0 ⇒ zero close spread)
     }
 
     /// @notice Position and treasury risk bounds. `notionalScale` is derived (leave 0).
@@ -161,9 +161,12 @@ interface IH2Market {
         bool    closed;
         uint64  closeTime;
         uint256 closePrice;
-        int256  realizedPnl;
+        // The three fields below describe the FINAL settlement only (full close, expiry or wipe).
+        // Earlier partial decreases are not accumulated here: sum `PositionDecreased` for
+        // lifetime figures.
+        int256  realizedPnl;    // final slice's PnL net of funding and close fee (−col on a wipe)
         uint256 makerCutPaid;   // winnings cut taken (name kept for indexer continuity)
-        uint256 payoutReceived;
+        uint256 payoutReceived; // derived: col + realizedPnl − makerCutPaid, floored at 0
     }
 
     /// @notice A market's share vault.
@@ -333,15 +336,14 @@ interface IH2Market {
     // ============================================================
 
     /// @notice Create a market. Permissionless; `msg.sender` is recorded as the creator
-    /// (identity only — the treasury is a role-less share vault). All three param structs
+    /// (identity only — the treasury is a role-less share vault). All four param structs
     /// are validated then frozen. Structural rules beyond field bounds:
     ///  - the market's `priceTick` must equal the primary feed's tick;
-    ///  - the ANTI-SANDWICH bound: `openFlatPpm + closeFlatPpm ≥ maxDeviationPpm` — the
-    ///    minimum round-trip cost must exceed the worst oracle disagreement the gate
-    ///    tolerates, so the treasury can never be traded as a deviation ATM;
     ///  - the coupled funding ceiling: `fundingRateCapPerSec × primaryStaleSecs ×
     ///    maxLeverage ≤ ½·PCT_SCALE` — funding during the window users cannot exit without
     ///    the operator can never eat more than half of worst-case collateral.
+    /// There is deliberately NO fee floor tying `openFlatPpm + closeFlatPpm` to
+    /// `maxDeviationPpm` (see ORACLE_DESIGN.md, "On sandwiching the treasury").
     function createMarket(
         address token,
         FeeParams calldata fees,
@@ -355,6 +357,8 @@ interface IH2Market {
 
     function usdm() external view returns (IERC20);
     function oracle() external view returns (address);
+    /// @notice The LAST allocated market id (0 if none) — ids start at 1 and the counter is
+    /// pre-incremented. Use `createMarket`'s return value or `MarketCreated` for a new market.
     function nextMarketId() external view returns (uint256);
     function creatorOf(uint256 marketId) external view returns (address);
     function feeParamsOf(uint256 marketId) external view returns (FeeParams memory);
@@ -468,6 +472,7 @@ interface IH2Market {
     // position views
     // ============================================================
 
+    /// @notice The LAST allocated position id (0 if none), like `nextMarketId`.
     function nextPositionId() external view returns (uint256);
     function activePositionId(address user, uint256 marketId) external view returns (uint256);
     function nonceUsed(address user, uint256 channel, uint256 nonce) external view returns (bool);

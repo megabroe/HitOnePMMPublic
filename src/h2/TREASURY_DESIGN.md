@@ -100,8 +100,11 @@ An order may name a **builder** (an address) and a **`builderFeePpm`** — both
 inside the user's signed order, so the user consents to the referral and its
 rate. The market freezes a cap (`maxBuilderFeePpm`); an order's rate must sit at
 or under it. The builder is per-order, so a user can open through one builder and
-close through another (never locked in). The winnings realized on a decrease or
-an increase-crystallization pay the order's builder too, not just the flat fees.
+close through another (never locked in). A close or decrease order's builder
+shares in the winnings cut that order realizes, as well as in its close fee. An
+increase realizes nothing: it blends the entry price and funding checkpoint and
+leaves the unrealized profit in the position, so an increase order's builder
+earns only its share of the open fee on the added size.
 
 Builder **eligibility lives in a separate contract**, not in the market: each
 market freezes an `IBuilderRegistry` address at creation (`builderRegistryOf`;
@@ -153,12 +156,26 @@ profits, net of the oracle rake. The exchange does **not** hedge on the lenders'
 behalf and holds no buffer for them — a lender who wants to neutralize the
 directional exposure must do it themselves, off-platform.
 
-The contract's one structural bound on that variance is the market's frozen
-**`maxOISkew`**: it caps how far net-long-minus-net-short the book can run, i.e.
-the largest directional position the vault can ever be forced to hold. Unlike a
-hedge it needs no trusted operator to enforce — it is a creation-time parameter
-checked on every open. Sizing it is the difference between "bounded house" and
-"unbounded directional bet."
+The contract's structural bounds on that variance are the market's frozen OI
+caps, **`maxOIGross`** and **`maxOISkew`**. Both are **entry-notional limits
+checked when a position opens or increases**, not a standing bound on the
+vault's exposure:
+
+- **Closes are never checked.** Closing the minority side can leave the skew
+  above `maxOISkew`. While it is above, an open or increase is accepted only if
+  it does not grow the skew, so minority-side orders can walk the book back
+  under the cap.
+- **OI is tracked at entry notional** and is not re-marked as the price moves.
+- **Skew is not a hedge measure.** A losing position can pay at most its
+  collateral, while a winner is owed its full profit. A notionally balanced
+  book therefore still leaves the vault paying winners once the leveraged
+  losers are exhausted: what the vault can be asked to pay scales with gross
+  open interest and the size of the move, not with the skew alone.
+
+Unlike a hedge, the caps need no trusted operator to enforce — they are
+creation-time parameters checked on every open and increase. Sizing them
+against the pool is the difference between "bounded house" and "unbounded
+directional bet."
 
 Before depositing, and before each position they hold, lenders should read the
 cheap views: `vaultOf` (NAV, share price, pool size, rake terms) and `stakeOf`

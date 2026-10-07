@@ -97,6 +97,7 @@ interface IH2Oracle {
     // ============================================================
 
     error UnknownFeed();
+    error RingEntryOutOfRange(); // ringEntry index outside the retained [head − RING_LEN, head) window
     error NotOperator();
     error BadFeedParams();
     error BadMark();          // zero, not a tick multiple, or overflows units
@@ -162,6 +163,9 @@ interface IH2Oracle {
     // views
     // ============================================================
 
+    /// @notice The LAST allocated feed id (0 if no feed exists) — ids start at 1 and the counter
+    /// is pre-incremented, so this is NOT the id the next `createFeed` will return. Use
+    /// `createFeed`'s return value or the `FeedCreated` event for a newly created feed.
     function nextFeedId() external view returns (uint256);
     function feedOf(uint256 feedId) external view returns (FeedView memory);
     /// @notice One side's funding index projected to now at the live rate and mark.
