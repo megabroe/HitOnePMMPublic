@@ -158,6 +158,8 @@ contract H2Oracle is IH2Oracle, ReentrancyGuard {
         if (units >= UNITS_CAP) revert BadMark();
         if (_absRate(rateLong) > f.maxRatePerSec || _absRate(rateShort) > f.maxRatePerSec)
             revert RateCapExceeded();
+        // The pool must never be a net funding payer to a hedged long+short pair (#36).
+        if (int256(rateLong) + int256(rateShort) < 0) revert NetNegativeFunding();
 
         _checkReferenceBand(f, mark1e18);
 
