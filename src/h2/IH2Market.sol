@@ -414,7 +414,8 @@ interface IH2Market {
     function cancelNonce(uint256 channel, uint256 nonce) external;
 
     /// @notice Anyone may force-close `id` once `expiresAt` has passed; settles at the
-    /// primary feed's last mark (documented: under dual oracle failure this is the exit).
+    /// primary feed's mark while it is fresh, else at a fresh fallback price with the fallback
+    /// close spread against the position. Under dual oracle failure the last mark is the exit.
     function expirePosition(uint256 id) external;
 
     // ============================================================
