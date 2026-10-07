@@ -468,9 +468,12 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
     {
         int256 effPnl = pnl - fundingPaid;
         if (effPnl > 0) {
-            _drainPool(marketId, uint256(effPnl));
-            // The winnings cut is a fee the builder shares in (isOpenSide = false: it's a close).
+            // Credit the winnings cut FIRST so `_drainPool`'s solvency check sees the true net debit
+            // (effPnl − the cut's pool share); the rake and builder share are funded from the same
+            // drained amount either way, so final balances are identical. The builder shares in the
+            // cut (isOpenSide = false: it's a close).
             if (cut > 0) _creditWithBuilder(marketId, cut, b.builder, b.feePpm, positionId, false);
+            _drainPool(marketId, uint256(effPnl));
         } else if (effPnl < 0) {
             uint256 loss = uint256(-effPnl);
             if (loss > posCol) loss = posCol;
